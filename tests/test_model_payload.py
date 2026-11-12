@@ -7,7 +7,10 @@ import httpx
 import pytest
 
 from backend.app.agents.llm_agents import HybridInvestmentAgent, LLMConfig, OpenAICompatibleLLM
-from backend.app.model_payload import baseline_for_model, compact_model_schema, fact_for_model, profile_for_model
+from backend.app.model_payload import (
+    baseline_for_model, compact_model_schema, fact_for_model, profile_for_model,
+    compact_fact_references, rewrite_fact_references,
+)
 from backend.app.models import AgentResult, FactRecord, OrchestrationRequest, TaskStatus, UserProfile
 from backend.app.risk_questionnaire import QUESTIONS, evaluate_answers
 from backend.app.semantic import (
@@ -30,6 +33,96 @@ def fact(**updates):
                                  source_id="DEMO_SNAPSHOT", source_url="https://example.com/evidence",
                                  source_field="涨跌幅", observation_date="2026-10-04",
                                  period="2026Q3", entity_code="600000", produced_by="quote@示例"), **updates))
+
+
+def test_short_references_preserve_literal_evidence_and_unresolved_lineage():
+    original_id = "IW-0123456789ABCDEF"
+    payload = {"authorized_facts": [
+        {"fact_id": original_id, "value": {"fact_id": original_id},
+         "quote": original_id, "source_url": "https://example.com/" + original_id,
+         "derived_from": ["missing-long-parent", "f1"]},
+        {"fact_id": "f1", "value": 0}],
+        "rule_baseline": {"facts_used": [original_id]},
+        "results": [{"facts_used": [original_id]}]}
+    before = deepcopy(payload)
+    wire, inverse = compact_fact_references(payload)
+    assert wire["authorized_facts"][0]["fact_id"] == "f2"
+    assert wire["authorized_facts"][0]["derived_from"] == ["missing-long-parent", "f1"]
+    assert wire["authorized_facts"][0]["value"] == before["authorized_facts"][0]["value"]
+    assert wire["authorized_facts"][0]["quote"] == original_id
+    assert wire["authorized_facts"][0]["source_url"].endswith(original_id)
+    assert wire["rule_baseline"]["facts_used"] == ["f2"]
+    assert rewrite_fact_references(wire, inverse) == before
+    assert payload == before
+    # Unrecognized references stay unrecognized, including inside model assessments.
+    assert rewrite_fact_references({"facts_used": ["f2", "f999"],
+        "details": {"evidence_id": "f2", "quote": "f2"}}, inverse) == {
+        "facts_used": [original_id, "f999"],
+        "details": {"evidence_id": original_id, "quote": "f2"}}
+
+
+@pytest.mark.asyncio
+async def test_short_reference_cache_keeps_original_identity_and_restores_before_validation():
+    sent = []
+    def handler(request):
+        payload = json.loads(json.loads(request.content)["messages"][1]["content"])
+        sent.append(payload)
+        cited = payload["authorized_facts"][0]["fact_id"]
+        answer = {"opinion": "研究", "confidence": .9, "score": 50, "facts_used": [cited]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(answer)}}]})
+    client = OpenAICompatibleLLM(LLMConfig("https://model.test", "fake", "test"),
+                                 transport=httpx.MockTransport(handler))
+    collector = {"calls": [], "mode": "fast", "cache_scope": "account-a"}
+    token = analysis_telemetry.set(collector)
+    def payload(fact_id):
+        return {"required_output": {"agent_id": "market"},
+                "authorized_facts": [{"fact_id": fact_id, "value": 0}]}
+    try:
+        first, second = "IW-0123456789ABCDEF", "IW-FEDCBA9876543210"
+        assert (await client.complete_json(system="s", payload=payload(first)))["facts_used"] == [first]
+        assert (await client.complete_json(system="s", payload=payload(first)))["facts_used"] == [first]
+        assert (await client.complete_json(system="s", payload=payload(second)))["facts_used"] == [second]
+        assert len(sent) == 2  # Both wire payloads look alike, original IDs still invalidate reuse.
+        assert all(p["authorized_facts"][0]["fact_id"] == "f1" for p in sent)
+        assert collector["calls"][0]["reference_chars_saved"] > 0
+        assert collector["model_fact_ids"] == {first, second}
+    finally:
+        analysis_telemetry.reset(token)
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fast_output_keeps_complete_rule_details_and_constraints():
+    sent = []
+    def handler(request):
+        wire = json.loads(json.loads(request.content)["messages"][1]["content"])
+        sent.append(wire)
+        answer = {"opinion": "研究示例", "score": 50, "confidence": .9,
+                  "facts_used": [wire["authorized_facts"][0]["fact_id"]]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(answer)}}]})
+    client = OpenAICompatibleLLM(LLMConfig("https://model.test", "fake", "test"),
+                                 transport=httpx.MockTransport(handler))
+    evidence = fact(fact_id="IW-0123456789ABCDEF", field="close_price", value=1)
+    baseline = AgentResult(agent_id="security", status=TaskStatus.COMPLETED, opinion="基线", score=50, confidence=.8,
+        facts_used=[evidence.fact_id], confidence_reasons=["已核验原始证据"],
+        risk_flags=["波动风险"], invalidation_conditions=["公告更正"],
+        details={"single_security_limit": .1, "missing_value": None})
+    async def rule(request):
+        return baseline.model_copy(deep=True)
+    try:
+        result = await HybridInvestmentAgent("security", rule, client).run(OrchestrationRequest(
+            query="研究示例", profile=profile(), facts=[evidence], research_mode="fast"))
+        assert "confidence_reasons" not in sent[0]["required_output"]
+        assert "details" not in sent[0]["required_output"]
+        assert result.facts_used == [evidence.fact_id]
+        assert result.confidence_reasons == baseline.confidence_reasons
+        assert result.risk_flags == baseline.risk_flags
+        assert result.invalidation_conditions == baseline.invalidation_conditions
+        assert result.details["single_security_limit"] == .1
+        assert result.details["missing_value"] is None
+        assert result.details["engine"] == "third_party_llm"
+    finally:
+        await client.aclose()
 
 
 def test_profile_compression_retains_questions_and_all_business_constraints():

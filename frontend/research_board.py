@@ -368,7 +368,9 @@ def render_research_board(api_base: str, page_direction: str, fetch: Callable) -
     pending = key in st.session_state.get("research_board_prefetch", {})
     polling = pending or not entry or monotonic()-entry["loaded_at"] >= board_cache_ttl(entry["result"]) or entry["result"].get("status") == "loading"
     st.session_state[f"board_poll_{direction}"] = polling
-    st.fragment(run_every=1 if polling else None)(_render_research_board)(api_base, page_direction, fetch)
+    # Keep the selected board fresh even after the initial load has finished.
+    # load_board coalesces pending work and only refetches expired entries.
+    st.fragment(run_every=1 if polling else 15)(_render_research_board)(api_base, page_direction, fetch)
 
 
 def _render_research_board(api_base: str, page_direction: str, fetch: Callable) -> None:
@@ -379,6 +381,25 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable) 
             st.space("stretch")
             refresh = st.button("刷新数据", key=f"board_refresh_{direction}", icon=":material/refresh:")
         target = None
+        if direction == "industry":
+            target_key = "board_target_industry"
+            st.session_state.setdefault(target_key, None)
+            options = [None, "广告营销", "半导体", "银行", "游戏", "数字媒体", "影视院线", "电力", "医药生物"]
+            current = st.session_state.get(target_key)
+            if current and current not in options:
+                options.append(current)
+            target = st.selectbox(
+                "查询行业", options, key=target_key, accept_new_options=True, persist_state="session",
+                format_func=lambda value: "全部行业概览" if value is None else value,
+                placeholder="选择或输入行业名称 / 板块代码",
+                help="可输入新行业，按回车提交；修改选择后重新查询，选择全部行业概览可恢复排名列表。")
+            if target is not None:
+                target = str(target).strip()
+                if len(target) > 60:
+                    st.error("行业名称或代码最多 60 个字符。")
+                    return
+                target = target or None
+            st.caption("当前查询：" + (target or "全部行业概览") + " · 行业选择仅影响数据区，咨询时请在问题中写明行业。")
         if direction in {"stock", "fund", "convertible"}:
             names = known_entities(api_base, direction)
             options = list(names) if direction == "stock" else [None, *names]
@@ -424,7 +445,7 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable) 
                 return
             with st.container(border=True):
                 st.markdown(":material/cloud_off: **本页数据暂未取得**" if result.get("status") == "unavailable" else ":material/inbox: **本次没有可展示的数据**")
-                st.caption("请稍后点击“刷新数据”。下方提问仍可使用，分析会再次尝试获取所需资料。")
+                st.caption("请稍后点击“刷新数据”。下方提问仍可使用已加载资料；需要最新资料时请先刷新或在资料面板加载。")
                 messages = [section.get("message") for section in result.get("sections", []) if section.get("message")]
                 if messages:
                     st.caption(messages[0])

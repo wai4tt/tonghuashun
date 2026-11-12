@@ -11,6 +11,7 @@ import streamlit as st
 from backend.app import main
 from frontend import research_board, streamlit_app as ui
 from frontend.account_prefetch import start_account_prefetch, take_account_result, NOT_PREFETCHED
+from frontend import account_prefetch
 from frontend.api_client import ApiResult
 
 
@@ -39,7 +40,7 @@ def test_slow_account_reads_are_parallel_and_do_not_block_or_duplicate(monkeypat
                               if path == "/profile" else [])
 
     with ThreadPoolExecutor(max_workers=3) as executor, httpx.Client(transport=httpx.MockTransport(transport)) as client:
-        monkeypatch.setattr(research_board, "board_prefetch_executor", lambda: executor)
+        monkeypatch.setattr(account_prefetch, "account_read_executor", lambda: executor)
         start_account_prefetch("http://test-only", "original-token", client)
         try:
             assert all(event.wait(2) for event in started), "All reads must start before any finishes"
@@ -75,7 +76,7 @@ def test_logout_discards_late_account_results(monkeypatch):
         return httpx.Response(200, json={"profile": {"confirmed": True}})
 
     with ThreadPoolExecutor(max_workers=3) as executor, httpx.Client(transport=httpx.MockTransport(transport)) as client:
-        monkeypatch.setattr(research_board, "board_prefetch_executor", lambda: executor)
+        monkeypatch.setattr(account_prefetch, "account_read_executor", lambda: executor)
         start_account_prefetch("http://test-only", "old-account", client)
         try:
             assert started.wait(2)

@@ -46,6 +46,8 @@ async def recover_research(
 ) -> tuple[OrchestrationRequest, DataAcquisitionResult]:
     """Each phase may repair once; agent requests cannot create an unbounded loop."""
     phase = "before_analysis" if advice is None else "after_analysis"
+    started = perf_counter()
+    time_budget = max(0, pipeline.recovery_timeout_seconds - audit.recovery_elapsed_ms / 1000)
     phases = list(audit.recovery_phases)
     if not phases and audit.recovery_rounds:
         if audit.recovery_phase is None:
@@ -57,6 +59,9 @@ async def recover_research(
                 or advice.compliance.status is ComplianceStatus.BLOCK))
             or intent in {Intent.UNKNOWN, Intent.EDUCATION}):
         return request, audit
+
+    if time_budget <= 0:
+        return request, audit.model_copy(update={"recovery_budget_exhausted": True})
 
     gaps = missing_fields_by_agent(request.facts, intent, now=pipeline.now())
     requested_by_agents = agent_requirements(advice.agent_results) if advice else {}
@@ -127,7 +132,7 @@ async def recover_research(
         extra.extend([ResearchCapability.BASIC_INFO, ResearchCapability.SHAREHOLDER_EQUITY])
         methods.update({"get_basic_info", "get_shareholder_equity"})
     target = pipeline._validated_target(request, target)
-    deadline = perf_counter() + pipeline.recovery_timeout_seconds
+    deadline = started + time_budget
     remaining = lambda: max(0, deadline - perf_counter())
     calls = [call for call in pipeline._calls_for(request, intent, target, extra)
              if (call.method in methods or call.key in conflicted_keys)
@@ -215,16 +220,20 @@ async def recover_research(
     enriched = align_security_documents(pipeline, enriched, intent, target)
     aligned_ids = {f.fact_id: f for f in enriched.facts}
     fetched = [aligned_ids[f.fact_id] for f in fetched]
+    document_started = perf_counter()
     documents, document_calls, document_success, document_empty, document_errors = await read_gap_documents(
         pipeline, enriched, intent, target, fetched, timeout_seconds=remaining())
+    timings["documents"] = round((perf_counter() - document_started) * 1000, 2)
     enriched = enriched.model_copy(update={"facts": _merge_by_fact_id([*enriched.facts, *documents])})
     successful.extend(document_success)
     empty.extend(document_empty)
     errors.update(document_errors)
     failed.extend(document_errors)
     enriched = derive_gap_metrics(pipeline, enriched, intent, target)
+    assessment_started = perf_counter()
     assessed, assessment_status, targets = await assess_gap_evidence(pipeline, enriched, intent, target, semantic,
                                                                    timeout_seconds=remaining())
+    timings["assessment"] = round((perf_counter() - assessment_started) * 1000, 2)
     added_ids = {f.fact_id for f in assessed.facts} - {f.fact_id for f in request.facts}
     if not attempted and not added_ids and assessment_status == "not_required":
         return request, audit
@@ -232,6 +241,8 @@ async def recover_research(
         fulfillment[call.label] = {"status": "deferred", "required_fields": list(call.required_fields),
                                   "reason_codes": ["RECOVERY_TIME_BUDGET" if remaining() <= 0 else "CALL_BUDGET"]}
     updates = dict(
+        recovery_elapsed_ms=audit.recovery_elapsed_ms + (perf_counter() - started) * 1000,
+        recovery_budget_exhausted=remaining() <= 0,
         recovery_rounds=audit.recovery_rounds + 1, recovery_phases=[*phases, phase],
         recovery_agent_requirements={**audit.recovery_agent_requirements, **requested_by_agents},
         recovery_capabilities=[call.label for call in attempted] + document_calls,
@@ -257,6 +268,7 @@ async def recover_research(
         "capabilities": updates["recovery_capabilities"],
         "successful_capabilities": successful, "empty_capabilities": empty,
         "failed_capabilities": failed, "errors": errors, "evidence": fulfillment,
+        "assessment_status": assessment_status, "timings_ms": timings,
         "blocked_families": {family: errors[call.label] for call in attempted
             if errors.get(call.label, {}).get("retryable") is False
             for family in CALL_FAMILIES.get(call.method, ())},

@@ -103,3 +103,18 @@ def test_partial_data_keeps_market_news_when_index_data_is_missing():
     assert any('仍然可看的真实结构资讯' in item.value for item in app.markdown)
     assert not app.metric
     assert len(app.chat_input)==1
+
+
+def test_industry_selection_can_change_and_return_to_overview():
+    data = {'page': '行业分析', 'results': {'industry': payload('industry')}}
+    app = AppTest.from_string(script(data)).run(timeout=15)
+    assert not app.exception
+    next(w for w in app.selectbox if w.label == '查询行业').select('广告营销').run(timeout=15)
+    assert not app.exception
+    assert app.session_state['board_calls'][-1] == {'direction': 'industry', 'target': '广告营销'}
+    next(w for w in app.selectbox if w.label == '查询行业').select('半导体').run(timeout=15)
+    assert app.session_state['board_calls'][-1]['target'] == '半导体'
+    next(w for w in app.selectbox if w.label == '查询行业').select(None).run(timeout=15)
+    assert not app.exception
+    assert next(w for w in app.selectbox if w.label == '查询行业').value is None
+    assert app.session_state['facts'] == []

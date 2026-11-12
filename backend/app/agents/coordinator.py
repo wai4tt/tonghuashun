@@ -195,6 +195,7 @@ class CoordinatorAgent:
         self, request: OrchestrationRequest, *, understanding: RequestUnderstanding | None = None,
         metrics_sink: dict[str, Any] | None = None,
         progress_sink: Callable[[str], None] | None = None,
+        recovery_hook: Callable[[AdvicePackage], Awaitable[OrchestrationRequest]] | None = None,
     ) -> AdvicePackage:
         """按安全顺序执行计划，并始终返回可审计的 AdvicePackage。
 
@@ -280,6 +281,26 @@ class CoordinatorAgent:
             verification_node.status = TaskStatus.DEGRADED if isinstance(exc, TimeoutError) else TaskStatus.FAILED
             return self._gate_failure(plan, results, "FACT_VERIFICATION_UNAVAILABLE", "资料核验暂不可用，请刷新资料后重试。")
         verification_node.status = TaskStatus.COMPLETED
+        # 内部预检只用于发现资料缺口，绝不发布为最终建议。若补取改变事实，
+        # 重跑专业分析与引用核验；完整语义复核只审查最后一轮意见，避免重复等待。
+        preflight_compliance = None
+        if recovery_hook is not None:
+            try:
+                preflight_compliance = await asyncio.wait_for(
+                    self.compliance_checker(request, results), timeout=self._llm_node_timeout,
+                )
+            except Exception:
+                return self._gate_failure(plan, results, "COMPLIANCE_UNAVAILABLE", "风险检查暂不可用，请稍后重试或转人工复核。")
+            if preflight_compliance.status is not ComplianceStatus.BLOCK:
+                internal_compliance = preflight_compliance.model_copy(update={"status": ComplianceStatus.REVIEW})
+                provisional = self._aggregate(request, plan, results,
+                    cross_validate_results(results, request.facts), internal_compliance)
+                recovered = await recovery_hook(provisional)
+                if recovered is not request:
+                    if progress_sink is not None:
+                        progress_sink("重新分析")
+                    return await self.run(recovered, understanding=understanding,
+                        metrics_sink=metrics_sink, progress_sink=progress_sink)
         # 合规器使用核验后的结果作最终判定，保证无来源结论无法被放行。
         compliance_node = next(node for node in plan.nodes if node.agent_id == "compliance")
         compliance_node.status = TaskStatus.RUNNING
@@ -287,7 +308,9 @@ class CoordinatorAgent:
             progress_sink("风险检查")
         try:
             async with asyncio.timeout(compliance_node.timeout_seconds):
-                cross_validation, compliance = await self._review_results(request, results)
+                cross_validation, compliance = await self._review_results(
+                    request, results, compliance=preflight_compliance,
+                )
         except Exception as exc:
             compliance_node.status = TaskStatus.DEGRADED if isinstance(exc, TimeoutError) else TaskStatus.FAILED
             return self._gate_failure(plan, results, "COMPLIANCE_UNAVAILABLE", "风险检查暂不可用，请稍后重试或转人工复核。")
@@ -297,10 +320,12 @@ class CoordinatorAgent:
 
     async def _review_results(
         self, request: OrchestrationRequest, results: list[AgentResult],
+        *, compliance: ComplianceResult | None = None,
     ) -> tuple[CrossValidationResult, ComplianceResult]:
         """数值与语义复核共同受合规节点的总时间预算约束。"""
         cross_validation = cross_validate_results(results, request.facts)
-        compliance = await self.compliance_checker(request, results)
+        if compliance is None:
+            compliance = await self.compliance_checker(request, results)
         # 所有专业意见合并为一次语义审核，补充数值一致性检查无法发现的实质矛盾。
         if compliance.status is not ComplianceStatus.BLOCK:
             review = await self.semantic.review(request, results)
@@ -691,19 +716,18 @@ def cross_validate_results(results: list[AgentResult], facts: list[FactRecord]) 
     # 派生评分不是第二个数据源；沿 derived_from 回溯原始资料。
     roots: dict[str, FactRecord] = {}
 
-    def add_roots(fact_id: str, visited: set[str]) -> None:
+    pending = list(used_ids)
+    visited = set()
+    while pending:
+        fact_id = pending.pop()
         if fact_id in visited or fact_id not in facts_by_id:
-            return
+            continue
         visited.add(fact_id)
         fact = facts_by_id[fact_id]
         if fact.derived_from:
-            for parent_id in fact.derived_from:
-                add_roots(parent_id, visited)
+            pending.extend(fact.derived_from)
         else:
             roots[fact.fact_id] = fact
-
-    for fact_id in used_ids:
-        add_roots(fact_id, set())
 
     # 对已引用指标，同时检查同一数据包里的其它有效同项记录。
     # 否则智能体只引用其中一条时，冲突记录会被遗漏。
@@ -857,25 +881,36 @@ async def verify_facts(
     current_time = now or datetime.now(timezone.utc)
     facts_by_id = {fact.fact_id: fact for fact in facts}
     known_fact_ids = set(facts_by_id)
-    validity_cache: dict[str, bool] = {}
-
-    def valid_chain(fact_id: str, visiting: set[str]) -> bool:
-        cached = validity_cache.get(fact_id)
-        if cached is not None:
-            return cached
-        fact = facts_by_id.get(fact_id)
-        if fact is None or fact_id in visiting or not _TAXONOMY.fact_is_current(fact, current_time):
-            return False
-        if fact.source_id.upper().startswith("DERIVED_") and not fact.derived_from:
-            return False
-        visiting.add(fact_id)
-        valid = all(valid_chain(parent_id, visiting) for parent_id in fact.derived_from)
-        visiting.remove(fact_id)
-        validity_cache[fact_id] = valid
-        return valid
-
-    # 派生评分的每条原始输入也必须存在、可追溯、质量合格且仍在时效内。
-    valid_fact_ids = {fact_id for fact_id in known_fact_ids if valid_chain(fact_id, set())}
+    # Resolve the evidence graph iteratively. Deep/cyclic supplied lineage must
+    # not exhaust Python's stack or repeatedly walk the same shared ancestors.
+    from collections import defaultdict, deque
+    children = defaultdict(list)
+    remaining = {}
+    valid = {}
+    ready = deque()
+    for fact_id, fact in facts_by_id.items():
+        parents = set(fact.derived_from)
+        remaining[fact_id] = len(parents & known_fact_ids)
+        valid[fact_id] = (
+            _TAXONOMY.fact_is_current(fact, current_time)
+            and not (fact.source_id.upper().startswith("DERIVED_") and not parents)
+            and parents <= known_fact_ids
+        )
+        for parent in parents & known_fact_ids:
+            children[parent].append(fact_id)
+        if not remaining[fact_id]:
+            ready.append(fact_id)
+    valid_fact_ids = set()
+    while ready:
+        fact_id = ready.popleft()
+        if valid[fact_id]:
+            valid_fact_ids.add(fact_id)
+        for child in children[fact_id]:
+            valid[child] = valid[child] and valid[fact_id]
+            remaining[child] -= 1
+            if not remaining[child]:
+                ready.append(child)
+    # Nodes in cycles, and descendants of cycles, never become ready.
     verified: list[AgentResult] = []
     for result in results:
         # 无效引用包括不存在、过期、低质量或派生链条不完整的事实。
@@ -897,7 +932,17 @@ async def verify_facts(
             result.citations = sorted({
                 fact.source_id for fact in facts if fact.fact_id in result.facts_used
             })
-            result.details = {"rejected_reference_count": rejected_count}
+            # Retain execution diagnostics without retaining unverified business claims.
+            result.details = {
+                **{key: value for key, value in result.details.items()
+                   if key in {"engine", "model", "duration_ms", "model_failure"}},
+                "rejected_reference_count": rejected_count,
+                "rejected_reference_reasons": sorted({
+                    "UNKNOWN_REFERENCE" if fid not in facts_by_id else
+                    "STALE_OR_INVALID_EVIDENCE" if not _TAXONOMY.fact_is_current(facts_by_id[fid], current_time)
+                    else "INVALID_EVIDENCE_LINEAGE" for fid in rejected
+                }),
+            }
         verified.append(result)
     return verified
 

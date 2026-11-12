@@ -19,6 +19,9 @@ def render_guide():
             st.markdown(f"**{title}**")
             st.write(description)
 
+    from frontend.review_guide import render_review_guide
+    render_review_guide()
+
 
 def market_glance(api_base, fetch):
     key = (api_base, "market", None)

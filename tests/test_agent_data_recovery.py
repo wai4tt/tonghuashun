@@ -192,7 +192,7 @@ def test_endpoint_reanalyzes_agent_need_after_preflight_and_runs_all_gates(monke
     assert body['data_acquisition']['recovery_reanalyzed']
     assert body['data_acquisition']['recovery_rounds'] == 2
     assert body['cross_validation']['status'] == body['compliance']['status'] == 'PASS'
-    assert counts == {'agent': 2, 'verify': 2, 'review': 2}
+    assert counts == {'agent': 2, 'verify': 2, 'review': 1}
     assert sum(isinstance(c, tuple) and c[0] == 'operations' for c in provider.calls) == 1
     assert 'business' in body['evidence']
 

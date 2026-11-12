@@ -19,6 +19,9 @@ def _clear_file_analysis() -> None:
 
 
 def render_trade_analysis(analysis: dict) -> None:
+    if analysis.get("input_kind") == "analysis_report":
+        render_report_analysis(analysis)
+        return
     st.caption(f"分析窗口：{analysis['window_start']} 至 {analysis['window_end']}；"
                f"实际成交日期：{analysis['first_trade_date']} 至 {analysis['last_trade_date']}")
     with st.container(horizontal=True):
@@ -61,11 +64,47 @@ def render_trade_analysis(analysis: dict) -> None:
                    f"文件校验值：{source['sha256']}")
 
 
+def render_report_analysis(analysis: dict) -> None:
+    st.info("已识别为交易行为分析报告；以下指标来自报告，尚未用逐笔成交明细验证。")
+    st.caption(f"报告期间：{analysis.get('window_start') or '未注明'} 至 {analysis.get('window_end') or '未注明'}")
+    with st.container(horizontal=True):
+        st.metric("报告成交笔数", f"{analysis['trade_count']:,} 笔", border=True)
+        st.metric("报告涉及股票", f"{analysis['security_count']} 只", border=True)
+        days = analysis.get("reported_median_holding_days")
+        st.metric("报告持仓时间中位数", f"{days:g} 天" if days is not None else "未注明", border=True)
+    for limitation in analysis["limitations"]:
+        st.caption(limitation)
+    if analysis.get("monthly"):
+        st.bar_chart([{"月份": row["month"], "成交笔数": row["trade_count"]} for row in analysis["monthly"]],
+                     x="月份", y="成交笔数")
+    with st.expander("报告指标与来源", expanded=True):
+        st.dataframe([{"指标": row["label"], "报告数值": row["value"], "单位或口径": row["unit"],
+                       "来源": f"{row['sheet']} 第 {row['row']} 行"} for row in analysis["report_metrics"]], hide_index=True)
+    for section in analysis["report_sections"]:
+        with st.expander(section["title"]):
+            first, second, third = section["columns"]
+            st.dataframe([{first: row["label"], second: row["value"], third: row["detail"],
+                           "本表重算占比": f"{row['calculated_share']:.1%}" if row["calculated_share"] is not None else "无法计算",
+                           "来源行": row["row"]} for row in section["rows"]], hide_index=True)
+            st.caption(f"本表数值合计：{section['calculated_total']:,.2f}；来源：{section['sheet']}，表头第 {section['header_row']} 行。")
+    with st.expander("原报告行为摘要与口径说明"):
+        for note in analysis.get("behavioral_notes", []):
+            st.write(note)
+        for note in analysis.get("source_notes", []):
+            st.write(note["text"])
+            st.caption(f"来源：{note['sheet']} 第 {note['row']} 行")
+        for check in analysis.get("reconciliation", []):
+            st.write(f"{check['label']}：表内重算 {check['calculated']:g}，报告 {check['reported']:g}，" +
+                     ("一致。" if check["matches"] else "不一致，请核对。"))
+    source = analysis["source"]
+    st.caption(f"来源：{source['file_name']}；文件校验值：{source['sha256']}")
+
+
 def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
     with st.container(border=True, key="trade-profile-panel"):
         st.subheader("从 Excel 分析用户画像")
-        st.caption("上传同一用户近一年的股票成交明细（.xlsx / .xls，最多 5 MB）。"
-                   "原始文件仅用于本次解析，确认后保存交易统计和行为摘要。")
+        st.caption("上传同一用户的股票成交明细或交易行为分析报告（.xlsx / .xls，最多 5 MB）。"
+                   "原始文件仅用于本次解析，确认后保存交易统计和行为摘要。明细按近一年统计，汇总报告保留原报告期间。")
         notice = st.session_state.pop("trade_profile_notice", None)
         if notice:
             st.success(notice)
@@ -75,7 +114,7 @@ def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
                 render_trade_analysis(saved)
         uploaded = st.file_uploader("选择股票交易记录 Excel", type=["xlsx", "xls"], max_upload_size=5,
                                     key="trade_profile_upload", on_change=_clear_file_analysis)
-        st.caption("必填字段：成交日期、证券代码、买卖方向、成交数量、成交价格。支持券商常见列名；读取后可手动匹配。")
+        st.caption("成交明细需包含日期、代码、买卖方向、数量、价格，可手动匹配列；分析报告自动识别多工作表中的关键指标、月度统计、板块题材偏好和成本。")
         if uploaded is None:
             return
         raw = uploaded.getvalue()
@@ -87,7 +126,7 @@ def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
         if st.button("读取 Excel", key="trade_profile_read"):
             st.session_state.pop("trade_profile_draft", None)
             st.session_state.pop("trade_profile_inspection", None)
-            with st.spinner("正在识别交易工作表…"):
+            with st.spinner("正在识别成交明细或分析报告…"):
                 result = api_request(api_base, "POST", "/profile/trades/inspect", base)
             if result:
                 st.session_state.trade_profile_inspection = result
@@ -98,6 +137,9 @@ def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
                         st.session_state.pop(key, None)
         inspection = st.session_state.get("trade_profile_inspection")
         if not inspection or st.session_state.get("trade_profile_file_digest") != digest:
+            return
+        if inspection.get("input_kind") == "analysis_report":
+            _render_report_import(api_base, base, digest, inspection, api_request=api_request)
             return
         sheet = st.selectbox("交易工作表", inspection["sheets"],
                              index=inspection["sheets"].index(inspection["sheet_name"]), key=f"trade_profile_sheet_{digest}")
@@ -145,26 +187,47 @@ def render_trade_profile(api_base: str, *, api_request: Callable) -> None:
             if analysis:
                 st.session_state.trade_profile_draft = {"signature": signature, "analysis": analysis,
                                                        "version": int(st.session_state.profile.get("version") or 1)}
-        draft = st.session_state.get("trade_profile_draft")
-        if not draft or draft["signature"] != signature:
-            return
-        render_trade_analysis(draft["analysis"])
-        st.caption("请核对交易统计，确认后补充到当前账号画像。")
-        has_risk_draft = bool(st.session_state.get("profile_draft"))
-        if has_risk_draft:
-            st.info("请先确认并保存上方的风险测评结果，再保存交易画像。")
-        stale = int(st.session_state.profile.get("version") or 1) != draft["version"]
-        if stale:
-            st.info("用户画像已更新，请重新点击“分析交易画像”后再核对并保存。")
-        if st.button("确认并保存交易画像", key="trade_profile_confirm", disabled=has_risk_draft or stale):
-            with st.spinner("正在保存交易画像…"):
-                profile = api_request(api_base, "POST", "/profile/trades/confirm",
-                                      {**payload, "expected_version": draft["version"]})
-            if profile:
-                st.session_state.profile = profile
-                st.session_state.pop("trade_profile_draft", None)
-                # 清除后台画像缓存，防止恢复逻辑用旧版本覆盖刚保存的摘要。
-                from frontend.account_prefetch import discard_account_result
-                discard_account_result(api_base, "/profile")
-                st.session_state.trade_profile_notice = "交易行为画像已保存。"
-                st.rerun()
+        _render_analysis_draft(api_base, payload, signature, api_request=api_request)
+
+
+def _render_report_import(api_base, base, digest, inspection, *, api_request):
+    st.success("已识别多工作表交易行为分析报告，无需匹配成交明细列。")
+    st.caption("将导入整份报告，保留原报告期间；确认前可核对指标、来源与数据差异。")
+    signature = "report:" + digest
+    draft = st.session_state.get("trade_profile_draft")
+    if not draft or draft.get("signature") != signature:
+        render_report_analysis(inspection["report_preview"])
+    if st.button("分析交易画像", key="trade_profile_analyze", type="primary"):
+        st.session_state.pop("trade_profile_draft", None)
+        with st.spinner("正在提取报告指标并核对表内合计…"):
+            analysis = api_request(api_base, "POST", "/profile/trades/analyze", base)
+        if analysis:
+            st.session_state.trade_profile_draft = {"signature": signature, "analysis": analysis,
+                                                   "version": int(st.session_state.profile.get("version") or 1)}
+    _render_analysis_draft(api_base, base, signature, api_request=api_request)
+
+
+def _render_analysis_draft(api_base, payload, signature, *, api_request):
+    draft = st.session_state.get("trade_profile_draft")
+    if not draft or draft["signature"] != signature:
+        return
+    render_trade_analysis(draft["analysis"])
+    st.caption("请核对交易统计，确认后补充到当前账号画像。")
+    has_risk_draft = bool(st.session_state.get("profile_draft"))
+    if has_risk_draft:
+        st.info("请先确认并保存上方的风险测评结果，再保存交易画像。")
+    stale = int(st.session_state.profile.get("version") or 1) != draft["version"]
+    if stale:
+        st.info("用户画像已更新，请重新点击“分析交易画像”后再核对并保存。")
+    if st.button("确认并保存交易画像", key="trade_profile_confirm", disabled=has_risk_draft or stale):
+        with st.spinner("正在保存交易画像…"):
+            profile = api_request(api_base, "POST", "/profile/trades/confirm",
+                                  {**payload, "expected_version": draft["version"]})
+        if profile:
+            st.session_state.profile = profile
+            st.session_state.pop("trade_profile_draft", None)
+            # 清除后台画像缓存，防止恢复逻辑用旧版本覆盖刚保存的摘要。
+            from frontend.account_prefetch import discard_account_result
+            discard_account_result(api_base, "/profile")
+            st.session_state.trade_profile_notice = "交易行为画像已保存。"
+            st.rerun()

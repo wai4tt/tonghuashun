@@ -111,8 +111,9 @@ async def run(output: Path):
     calls_before = len(llm.calls)
     analysis_started = perf_counter()
     result = await coordinator.run(request(
-        "请只根据提供的合成宏观评分分析这个测试市场的环境，解释各维度作用，"
-        "不要将其描述为真实行情，不要推荐具体产品或作收益承诺。", facts=facts))
+        "市场解读：请根据提供的合成测试市场评分，研判这个市场的宏观环境、行业景气和主要风险。"
+        "这些资料是合成测试数据，只形成测试市场研判，不推荐产品或承诺收益。",
+        research_direction="市场解读", research_mode="fast", facts=facts))
     analysis_seconds = round(perf_counter() - analysis_started, 3)
     record("analysis_pipeline",
            result.intent == "market_analysis" and len(result.agent_results) == 2
@@ -130,6 +131,7 @@ async def run(output: Path):
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({"passed": report["passed"], "logical_calls": len(llm.calls),
                       "report": str(output)}, ensure_ascii=False), flush=True)
+    await llm.aclose()
     return 0 if report["passed"] else 1
 
 

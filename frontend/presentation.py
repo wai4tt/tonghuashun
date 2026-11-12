@@ -46,7 +46,9 @@ FIELD_LABELS.update({
     "change": "涨跌幅", "change_amount": "涨跌额", "volume": "成交量", "turnover_rate": "换手率",
     "pe_ttm": "市盈率TTM", "pe_static": "静态市盈率", "pe_dynamic": "动态市盈率", "pb": "市净率",
     "roe": "净资产收益率", "roe_weighted": "加权净资产收益率",
+    "revenue": "营业收入", "net_profit": "归母净利润", "net_profit_growth": "归母净利润同比增长率",
     "revenue_growth": "营业收入增长率", "tracking_error": "跟踪误差",
+    "is_st": "是否 ST", "announcement_excerpt": "公告原文节选",
     "news": "新闻", "announcement": "公告", "research_report": "研报", "provider_response": "查询摘要",
     "company_name": "公司全称", "industry": "所属行业", "main_business": "主营业务", "listing_date": "上市日期",
     "revenue_composition": "主营构成", "major_customer": "主要客户", "major_supplier": "主要供应商",
@@ -428,6 +430,8 @@ def _render_conclusion_content(advice: dict[str, Any], *, key: str = "analysis-c
     render_investment_panel(advice, key=key)
     render_points("后续研究建议", visible_next_steps(advice))
     render_verification_records(advice, key=key)
+    from frontend.manual_review import render_manual_review
+    render_manual_review(advice, key=key)
     if advice.get("user_fit"):
         with st.expander("与您的投资偏好是否匹配", icon=":material/person_check:"):
             st.write(plain_language(advice["user_fit"]))
@@ -549,7 +553,7 @@ def render_logic_chain(advice: dict[str, Any]) -> None:
             st.caption(plain_language(compliance["reason"]))
 
 
-def render_source_trace(advice: dict[str, Any], *, collapsed: bool = True) -> None:
+def render_source_trace(advice: dict[str, Any], *, collapsed: bool = True, key: str | None = None) -> None:
     rows = source_trace_rows(advice)
 
     def body() -> None:
@@ -570,8 +574,9 @@ def render_source_trace(advice: dict[str, Any], *, collapsed: bool = True) -> No
                                ":material/rule:")
 
     if collapsed:
-        with st.expander(f"数据溯源（{len(rows)} 条）", icon=":material/database:"):
-            body()
+        with st.expander(f"数据溯源（{len(rows)} 条）", icon=":material/database:", key=key, on_change="rerun") as sources:
+            if sources.open:
+                body()
     else:
         body()
 

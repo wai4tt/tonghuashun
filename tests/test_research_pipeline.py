@@ -88,6 +88,7 @@ class FakeIwencaiProvider:
 def request_for_security(*, auto_fetch: bool = True) -> OrchestrationRequest:
     return OrchestrationRequest(
         query="请研究示例科技这只个股",
+        research_mode="deep",
         profile={"user_id": "u-auto", "risk_level": "R3", "confirmed": True},
         auto_fetch=auto_fetch,
     )

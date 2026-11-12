@@ -32,10 +32,10 @@ from urllib.parse import quote, urlparse
 import httpx
 import streamlit as st
 from frontend.risk_assessment import render_risk_assessment
-from frontend.trade_profile import render_trade_profile
 from backend.app.risk_questionnaire import assessment_is_current
 from frontend.result_views import render_advice, cached_answer_images, answer_export_payload, show_status
-from frontend.api_client import backend_http_client, request_json, overview_fetch, snapshot_fetch_factory
+from frontend.api_client import (backend_http_client, request_json, overview_fetch, snapshot_fetch_factory,
+                                 AnalysisProgress, request_analysis)
 from frontend.account_prefetch import (
     PENDING, NOT_PREFETCHED, cancel_account_prefetch, start_account_prefetch,
     take_account_result, poll_account_prefetch, discard_account_result,
@@ -230,7 +230,10 @@ def restore_conversation(detail: dict[str, Any]) -> None:
     assistant_messages = [message for message in st.session_state.conversation if message["role"] == "assistant"]
     st.session_state.advice = assistant_messages[-1].get("payload") if assistant_messages else None
     if st.session_state.advice and "facts" in st.session_state.advice:
-        st.session_state.facts = [dict(fact) for fact in st.session_state.advice["facts"]]
+        materials = next((message["payload"]["facts"] for message in reversed(assistant_messages)
+                          if message.get("payload") and "facts" in message["payload"]
+                          and not message["payload"].get("stock_recommendation")), [])
+        st.session_state.facts = [dict(fact) for fact in materials]
     save_research_session()
     st.session_state.pending_navigation = "投资问答"
     st.session_state.history_view = False
@@ -470,6 +473,7 @@ def init_session() -> None:
             "confirmed": False,
         },
     )
+    st.session_state.setdefault("research_mode", "instant")
     st.session_state.setdefault("facts", [])
     st.session_state.setdefault("portfolio", [])
     st.session_state.setdefault("watchlist", [])
@@ -590,7 +594,9 @@ def stream_analysis(api_base: str, payload: dict[str, Any]) -> dict[str, Any] | 
         try:
             with backend_http_client(api_base).stream(
                 "POST", f"{api_base}/portfolio/analyze/stream", json=payload, headers=headers,
-                timeout=httpx.Timeout(240.0, connect=10.0),
+                timeout=(httpx.Timeout(None, connect=10.0) if payload.get("research_mode") == "deep"
+                         else httpx.Timeout(2.8, connect=0.5) if payload.get("research_mode") in {"instant", "lite"}
+                         else httpx.Timeout(240.0, connect=10.0)),
             ) as response:
                 if response.status_code >= 400:
                     if response.status_code == 409:
@@ -629,6 +635,33 @@ def stream_analysis(api_base: str, payload: dict[str, Any]) -> dict[str, Any] | 
     return advice
 
 
+def selected_research_target(direction: str | None) -> str | None:
+    code = {"市场解读": "market", "行业分析": "industry", "个股研究": "stock",
+            "基金筛选": "fund", "可转债分析": "convertible"}.get(direction)
+    return st.session_state.get(f"board_target_{code}", "600519" if code == "stock" else None)
+
+
+def consultation_facts(api_base: str, direction: str | None) -> list[dict]:
+    """Copy selected-board facts without waiting for external data."""
+    facts = {fact["fact_id"]: dict(fact) for fact in st.session_state.facts}
+    codes = {"市场解读": "market", "行业分析": "industry", "个股研究": "stock",
+             "基金筛选": "fund", "可转债分析": "convertible"}
+    code = codes.get(direction)
+    target = selected_research_target(direction)
+    for key, entry in st.session_state.get("research_board_cache", {}).items():
+        if key != (api_base, code, target):
+            continue
+        for section in (entry.get("result") or {}).get("sections", []):
+            if section.get("status") != "ok":
+                continue
+            # Previous/loading sections are not used; the backend still checks
+            # every timestamp, source, value and derivation reference.
+            for fact in section.get("facts", []):
+                if isinstance(fact, dict) and fact.get("fact_id"):
+                    facts.setdefault(fact["fact_id"], dict(fact))
+    return list(facts.values())
+
+
 def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
     """携带最近多轮上下文调用统一分析端点，并更新会话历史。"""
     if not profile_ready():
@@ -640,10 +673,11 @@ def run_analysis(api_base: str, query: str) -> dict[str, Any] | None:
     user_turn = {"role": "user", "content": query, "created_at": utc_now()}
     payload = {
         "query": query,
+        "research_target": selected_research_target(st.session_state.get("active_research_direction")),
         "profile": st.session_state.profile,
-        "facts": st.session_state.facts,
+        "facts": consultation_facts(api_base, st.session_state.get("active_research_direction")),
         "auto_fetch": True,
-        "research_mode": st.session_state.get("research_mode", "deep"),
+        "research_mode": st.session_state.get("research_mode", "instant"),
         "portfolio": st.session_state.portfolio,
         "conversation_id": st.session_state.conversation_id,
         "context_messages": [
@@ -673,10 +707,25 @@ def analysis_executor() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=4, thread_name_prefix="wence-analysis")
 
 
-def submit_chat_analysis(api_base: str, direction: str, query: str) -> None:
+@st.cache_resource(show_spinner=False)
+def preview_executor() -> ThreadPoolExecutor:
+    """Keep short previews out of the long-running model queue."""
+    return ThreadPoolExecutor(max_workers=4, thread_name_prefix="wence-preview")
+
+
+@st.cache_resource(show_spinner=False)
+def prepared_delivery_executor() -> ThreadPoolExecutor:
+    """Ready reports never queue behind long model/recovery requests."""
+    return ThreadPoolExecutor(max_workers=8, thread_name_prefix="wence-prepared-delivery")
+
+
+def submit_chat_analysis(api_base: str, direction: str, query: str, *, recommend_stocks: bool = False) -> None:
     """立即显示问题，后台完成分析，避免等待期间锁住整页交互。"""
     if not profile_ready():
         st.warning("请先确认投资偏好，再开始分析。")
+        return
+    if not any(char.isalnum() for char in query.removeprefix(RESEARCH_PREFIX.get(direction, ""))):
+        st.warning("请输入有效的研究问题。")
         return
     jobs = st.session_state.setdefault("analysis_jobs", {})
     if direction in jobs:
@@ -686,21 +735,31 @@ def submit_chat_analysis(api_base: str, direction: str, query: str) -> None:
     payload = {
         "query": query,
         "research_direction": direction,
+        "research_target": None if recommend_stocks else selected_research_target(direction),
         "profile": dict(st.session_state.profile),
-        "facts": [dict(fact) for fact in st.session_state.facts],
+        "facts": [] if recommend_stocks else consultation_facts(api_base, direction),
         "auto_fetch": True,
-        "research_mode": st.session_state.get("research_mode", "deep"),
+        "research_mode": "deep" if recommend_stocks else st.session_state.get("research_mode", "instant"),
         "portfolio": [dict(item) for item in st.session_state.portfolio],
         "conversation_id": conversation_id,
-        "context_messages": [
+        "context_messages": [] if recommend_stocks else [
             {key: turn[key] for key in ("role", "content", "created_at") if key in turn}
             for turn in [*st.session_state.conversation, user_turn][-20:]
         ],
     }
     token = st.session_state.auth_token
     client = backend_http_client(api_base)
-    future = analysis_executor().submit(request_json, client, api_base, "POST", "/portfolio/analyze", payload, token)
-    jobs[direction] = {"future": future, "conversation_id": conversation_id}
+    progress = AnalysisProgress()
+    preview = None
+    if payload["research_mode"] == "progressive":
+        preview = preview_executor().submit(request_analysis, client, api_base, "POST", "/portfolio/analyze",
+            {**payload, "research_mode": "lite", "auto_fetch": False, "preview_only": True}, token, AnalysisProgress())
+        payload["research_mode"] = "deep"
+    executor = preview_executor() if payload["research_mode"] in {"lite", "instant"} else analysis_executor()
+    future = executor.submit(request_analysis, client, api_base, "POST", "/portfolio/analyze", payload, token, progress)
+    jobs[direction] = {"future": future, "conversation_id": conversation_id, "progress": progress,
+                       "preview_future": preview, "answer_id": str(uuid.uuid4()),
+                       "recommend_stocks": recommend_stocks}
     st.session_state.conversation.append(user_turn)
     save_research_session()
 
@@ -711,12 +770,19 @@ def finish_chat_analyses() -> bool:
     changed = False
     for direction, job in list(jobs.items()):
         future = job["future"]
-        if not future.done():
+        preview = job.get("preview_future")
+        is_preview = not future.done()
+        if is_preview and (preview is None or not preview.done() or job.get("preview_applied")):
             continue
         changed = True
-        jobs.pop(direction, None)
+        if is_preview:
+            job["preview_applied"] = True
+        else:
+            jobs.pop(direction, None)
+            if preview is not None:
+                preview.cancel()
         try:
-            result = future.result()
+            result = (preview if is_preview else future).result()
         except Exception:
             result = None
         advice = result.data if result is not None and isinstance(result.data, dict) else None
@@ -726,18 +792,35 @@ def finish_chat_analyses() -> bool:
         target = st.session_state if same_page else saved if saved and saved.get("conversation_id") == job["conversation_id"] else None
         if advice:
             if target is not None:
-                advice.setdefault("facts", [dict(fact) for fact in target["facts"]])
-                facts_by_id = {fact.get("fact_id"): fact for fact in target["facts"]}
-                for fact in advice.get("facts", []):
-                    facts_by_id[fact.get("fact_id")] = fact
-                target["facts"] = list(facts_by_id.values())
+                if job.get("recommend_stocks"):
+                    advice.setdefault("facts", [])
+                    if not advice.get("stock_recommendation"):
+                        advice["scope_notice"] = "本次未生成股票推荐结果，请查看下方原因后重试。"
+                else:
+                    advice.setdefault("facts", [dict(fact) for fact in target["facts"]])
+                    facts_by_id = {} if job.get("replace_facts") else {fact.get("fact_id"): fact for fact in target["facts"]}
+                    for fact in advice.get("facts", []):
+                        facts_by_id[fact.get("fact_id")] = fact
+                    target["facts"] = list(facts_by_id.values())
                 target["advice"] = advice
-                target["conversation"].append({"role": "assistant", "content": advice["conclusion"],
-                    "created_at": utc_now(), "payload": advice})
-            invalidate_recent_conversations()
-            st.session_state.pop("history_detail_cache", None)
-            st.session_state.analysis_notice = "后台分析已完成，可在最近咨询中查看。"
-        else:
+                turn = {"role": "assistant", "content": advice["conclusion"], "created_at": utc_now(),
+                        "payload": advice, "answer_id": job.get("answer_id"),
+                        "phase": "preview" if is_preview else "final"}
+                previous = next((item for item in target["conversation"]
+                                 if job.get("answer_id") and item.get("answer_id") == job["answer_id"]), None)
+                if previous is not None:
+                    previous.update(turn)
+                else:
+                    target["conversation"].append(turn)
+            if not is_preview:
+                invalidate_recent_conversations()
+                st.session_state.pop("history_detail_cache", None)
+                st.session_state.analysis_notice = "后台分析已完成，可在最近咨询中查看。"
+        elif not is_preview:
+            if target is not None:
+                for turn in target["conversation"]:
+                    if job.get("answer_id") and turn.get("answer_id") == job["answer_id"]:
+                        turn["phase"] = "preview_failed"
             st.session_state.analysis_notice = format_api_error(result.detail) if result is not None else "分析暂时无法完成，请稍后重试。"
         if same_page:
             save_research_session()
@@ -745,7 +828,9 @@ def finish_chat_analyses() -> bool:
 
 
 def background_analysis_status() -> None:
-    st.fragment(run_every=2 if st.session_state.get("analysis_jobs") else None)(_background_analysis_status)()
+    # A finished, fully reviewed answer should reach the page promptly.
+    # Poll only the local future; this does not submit additional API requests.
+    st.fragment(run_every=0.2 if st.session_state.get("analysis_jobs") else None)(_background_analysis_status)()
 
 
 def _background_analysis_status() -> None:
@@ -753,7 +838,10 @@ def _background_analysis_status() -> None:
         st.rerun()
     jobs = st.session_state.get("analysis_jobs", {})
     if jobs:
-        st.caption(f"{len(jobs)} 个问题正在后台分析，您可以继续使用其他功能。")
+        for direction, job in jobs.items():
+            progress = job.get("progress")
+            stage, elapsed = progress.snapshot() if progress else ("后台分析中", 0)
+            st.caption(f"{direction}：{stage} · 已用 {elapsed} 秒")
     notice = st.session_state.pop("analysis_notice", None)
     if notice:
         st.info(notice)
@@ -850,9 +938,136 @@ def fetch_research_board_data(api_base: str, direction: str, target: str | None)
     return create_board_fetch(api_base)(api_base, direction, target)
 
 
+@st.fragment(run_every=2)
+def render_prepared_stock_report(api_base: str) -> None:
+    """Precompute one selected stock task without blocking page interaction."""
+    target = str(st.session_state.get("board_target_stock", "600519")).strip()[:60]
+    if not target or not profile_ready() or not st.session_state.get("auth_token"):
+        return
+    from backend.app.services.prepared_research import TASKS
+    st.markdown("**完整深入报告**")
+    task = st.selectbox("提前准备的研究任务", list(TASKS), format_func=lambda key: TASKS[key],
+                        key="prepared_report_task")
+    portfolio = [dict(item) for item in st.session_state.portfolio]
+    key = (api_base, st.session_state.auth_token, target, task, st.session_state.profile.get("version", 1),
+           json.dumps(portfolio, ensure_ascii=False, sort_keys=True, default=str))
+    state = st.session_state.get("prepared_report_state")
+    if state is None or state["key"] != key:
+        if state and state.get("future"):
+            state["future"].cancel()
+        state = {"key": key, "future": None, "result": None, "next_poll": 0}
+        st.session_state.prepared_report_state = state
+    future = state.get("future")
+    if future is not None and future.done():
+        try:
+            result = future.result()
+            state["result"] = result.data if result and isinstance(result.data, dict) else None
+        except Exception:
+            state["result"] = None
+        state["future"] = None
+        state["next_poll"] = monotonic() + 2
+    payload = {"target": target, "task": task, "profile_version": key[4], "portfolio": portfolio}
+    if state["future"] is None and monotonic() >= state["next_poll"]:
+        state["future"] = account_read_executor().submit(request_json, backend_http_client(api_base),
+            api_base, "POST", "/research/prepared", payload, key[1])
+    result = state.get("result") or {}
+    status = result.get("status", "loading_data")
+    if status == "ready":
+        st.success("完整报告已完成分析与审核，点击后核对资料及画像并交付。")
+        st.caption("准备完成时间：" + str(result.get("generated_at") or ""))
+    elif status == "needs_review":
+        st.warning("预生成报告仍有证据缺口或待复核事项，尚未达到完整深入报告的交付标准。")
+    elif status == "data_unavailable":
+        st.warning("当前页面资料未齐，暂不能交付完整报告；数据恢复后会继续检查。")
+    elif status == "failed":
+        st.warning("本次完整报告准备未完成，可手动重新准备。")
+    else:
+        st.caption("正在后台准备完整深入报告（包括取数、补取、模型分析及最终审核）。准备耗时独立计算。")
+    direction = "个股研究"
+    if st.button("打开已审核的完整报告", key="prepared_report_open",
+                 disabled=status != "ready" or direction in st.session_state.get("analysis_jobs", {})):
+        query = result["query"]
+        progress = AnalysisProgress()
+        progress.update("核对已审核报告")
+        future = prepared_delivery_executor().submit(request_json, backend_http_client(api_base), api_base, "POST",
+            "/research/prepared/open", {**payload, "conversation_id": st.session_state.conversation_id}, key[1])
+        st.session_state.setdefault("analysis_jobs", {})[direction] = {
+            "future": future, "conversation_id": st.session_state.conversation_id, "progress": progress,
+            "answer_id": str(uuid.uuid4()), "replace_facts": True}
+        st.session_state.conversation.append({"role": "user", "content": query, "created_at": utc_now()})
+        save_research_session()
+        st.rerun()
+    if status in {"failed", "needs_review"} and st.button("重新准备完整报告", key="prepared_report_retry"):
+        if state.get("future"):
+            state["future"].cancel()
+        state["future"] = account_read_executor().submit(request_json, backend_http_client(api_base),
+            api_base, "POST", "/research/prepared", {**payload, "retry": True}, key[1])
+        state["result"] = None
+        st.rerun(scope="fragment")
+    st.caption("3秒目标适用于已经准备完成且仍匹配的完整报告。咨询区默认使用3秒研究；完整报告的后台准备时间独立计算。")
+
+
+RESEARCH_GUIDES = {
+    "市场解读": (
+        "在「市场数据」查看主要指数的涨跌和「宏观指标」的统计期。"
+        "如要问某个指数，使用「指数明细」里的名称。",
+        "请解读当前市场的主要指数涨跌，以及已加载的宏观指标。",
+    ),
+    "行业分析": (
+        "在「行业数据」的「查询行业」选择或输入行业名称、板块代码，按回车确认。"
+        "修改选择即可换行业，选择「全部行业概览」恢复排名列表。"
+        "把示例里的【行业名称】换成要研究的行业全名；行业选择只影响数据区。",
+        "请分析【行业名称】的行业涨跌幅和景气度。",
+    ),
+    "个股研究": (
+        "在「股票数据」的「查看股票」选择贵州茅台 · 600519，等行情和财务指标显示。"
+        "换一只股票时，先切换标的，再把问题里的代码换成对应代码。"
+        "也可以直接输入「分析当前股票」查看所选股票的资料概览。",
+        "请分析 600519 的估值和主要风险。",
+    ),
+    "基金筛选": (
+        "在「基金数据」的「查看基金」选择「全部概览」浏览已加载的基金，"
+        "或选定基金名称或代码查看单只基金。比较时先确认各基金都在已加载的资料中。",
+        "请分析基金 510300 的管理费率和单位净值。",
+    ),
+    "可转债分析": (
+        "在「可转债数据」的「转债指标一览」找到目标，再用「查看可转债」选定名称或代码。"
+        "等行情和指标显示后，把示例里的【转债代码】换成选中的代码。",
+        "请分析【转债代码】的价格、转股溢价率和到期收益率。",
+    ),
+}
+
+
+def render_research_guide(direction: str) -> None:
+    data_step, example = RESEARCH_GUIDES[direction]
+    with st.expander(f"操作指南 · {direction}", icon=":material/help_outline:"):
+        st.markdown(
+            "1. **确认投资偏好。** 首次使用时，在「风险评估」完成问卷并确认结果。\n"
+            "2. **加载本页数据。** 已有对话时先展开「本页领域数据」。"
+            f"{data_step}数据暂未取得时，点击「刷新数据」。\n"
+            "3. **在页底提问。** 默认使用「3秒研究」，根据已加载资料快速给出证据概要。"
+            "需要在线补查资料并完成完整核验时，选择「深度思考」。"
+        )
+        st.code(example, language=None, wrap_lines=True)
+        st.markdown(
+            "4. **核对结果。** 查看分析结论、引用资料和数据日期。"
+            "如果显示「引用 0 条资料」，先核对问题中的名称或代码，再确认资料已加载后重新提问。"
+        )
+        if direction == "个股研究":
+            st.markdown(
+                "5. **查看完整深入报告。** 在本页「完整深入报告」区，"
+                "把「提前准备的研究任务」选为「经营情况、估值及主要风险」或其他所需任务。"
+                "系统会自动在后台准备，审核完成后点击「打开已审核的完整报告」。"
+            )
+
+        from frontend.review_guide import render_review_guide
+        render_review_guide()
+
+
 def render_research_page(api_base: str, direction: str) -> None:
     render_page_header(direction)
     st.title(direction)
+    render_research_guide(direction)
     # 空白页先展示本方向的数据；已有对话中将数据折叠，方便继续阅读回答。
     if st.session_state.conversation:
         with st.expander("本页领域数据", expanded=False, on_change="rerun", icon=":material/monitoring:") as section:
@@ -863,6 +1078,9 @@ def render_research_page(api_base: str, direction: str) -> None:
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
         st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
+    if direction == "个股研究":
+        if profile_ready():
+            render_prepared_stock_report(api_base)
     if st.session_state.conversation:
         with st.container(horizontal=True, vertical_alignment="center"):
             st.markdown(f"**对话中 · {len(st.session_state.conversation)} 条消息**")
@@ -886,18 +1104,41 @@ def render_research_page(api_base: str, direction: str) -> None:
     for turn_index, turn in enumerate(st.session_state.conversation):
         with st.chat_message(turn["role"]):
             if turn["role"] == "assistant" and turn.get("payload"):
+                if turn.get("phase") == "preview":
+                    st.caption("已有资料概要 · 详细报告正在后台分析，完成后会更新此回答。")
+                elif turn.get("phase") == "preview_failed":
+                    st.caption("已有资料概要 · 详细报告未完成，本条仍仅为精简概要。")
                 previous = st.session_state.conversation[turn_index - 1] if turn_index else {}
                 render_advice(turn["payload"], export_key=f"chat_{turn_index}", compact=turn_index != latest_answer,
                               question=previous.get("content", "") if previous.get("role") == "user" else "")
+                answer = turn["payload"]
+                if (turn_index == latest_answer and previous.get("role") == "user"
+                        and answer.get("response_scope") == "clarification"
+                        and answer.get("intent") == "security_research"
+                        and answer.get("research_mode") in {"instant", "lite"}
+                        and direction not in st.session_state.get("analysis_jobs", {})):
+                    if st.button("补查资料并分析", key=f"load_answer_{direction}_{turn_index}", type="primary"):
+                        st.session_state.research_mode = "deep"
+                        submit_chat_analysis(api_base, direction, previous["content"])
+                        st.rerun()
             else:
                 content = turn["content"]
                 if turn["role"] == "user":
                     content = content.removeprefix(RESEARCH_PREFIX[direction])
                 st.write(plain_language(content) if turn["role"] == "assistant" else content)
     # 必须在页面顶层调用，Streamlit 才会将唯一输入框固定在底部。
-    st.selectbox("研究模式", options=["deep", "fast"],
-                 format_func=lambda mode: "深入研究" if mode == "deep" else "快速研究",
-                 key="research_mode", help="快速研究精简分析资料与篇幅；两种模式均执行事实核验和风险检查。")
+    mode = st.session_state.get("research_mode")
+    if mode not in {"instant", "deep"}:
+        st.session_state.research_mode = "deep" if mode in {"auto", "progressive"} else "instant"
+    st.segmented_control("研究模式", options=["instant", "deep"], required=True,
+                         format_func=lambda value: {"instant": "3秒研究", "deep": "深度思考"}[value],
+                         key="research_mode", width="stretch", persist_state="session",
+                         help="3秒研究使用已加载资料；深度思考会在线补查并完成完整核验，不设整次研究的总时限。")
+    mode = st.session_state.research_mode
+    if mode == "instant":
+        st.caption("使用已加载资料，3秒内给出证据概要；需要补查资料和完整核验请选择深度思考。")
+    else:
+        st.caption("在线补查资料并完成分析与审核；不设整次研究的总时限，进度会持续显示。")
     query = st.chat_input(QUICK_ASK_PROMPTS[direction], key=f"research_chat_{direction}",
                           disabled=not profile_ready() or direction in st.session_state.get("analysis_jobs", {}),
                           width="stretch")
@@ -1022,6 +1263,7 @@ def render_materials_body(api_base: str) -> None:
 
 def page_profile(api_base: str) -> None:
     """保留风险问卷，支持从股票交易记录补充行为画像。"""
+    from frontend.trade_profile import render_trade_profile
     render_page_header("风险评估")
     st.title("风险评估")
     render_risk_assessment(api_base, api_request=api_request)
@@ -1478,11 +1720,17 @@ def reset_user_session() -> None:
     """退出时清理仅属于当前账号的浏览器状态。"""
     cancel_board_prefetch()
     cancel_account_prefetch()
+    prepared = st.session_state.pop("prepared_report_state", None)
+    if prepared and prepared.get("future"):
+        prepared["future"].cancel()
+    st.session_state.pop("prepared_report_task", None)
     status_task = st.session_state.pop("session_status_task", None)
     if status_task:
         status_task["future"].cancel()
     for job in st.session_state.get("analysis_jobs", {}).values():
         job["future"].cancel()
+        if job.get("preview_future") is not None:
+            job["preview_future"].cancel()
     for key in list(st.session_state):
         if key.startswith("snapshot_"):
             value = st.session_state.pop(key, None)
@@ -1505,7 +1753,7 @@ def reset_user_session() -> None:
     ):
         st.session_state.pop(key, None)
     for key in list(st.session_state):
-        if key.startswith(("trade_profile_", "risk_score_", "risk_answer_", "research_chat_", "board_target_", "board_refresh_", "board_poll_", "admin_")) or key == "profile_narrative":
+        if key.startswith(("manual_review_", "trade_profile_", "risk_score_", "risk_answer_", "research_chat_", "board_target_", "board_refresh_", "board_poll_", "admin_")) or key == "profile_narrative":
             st.session_state.pop(key, None)
     st.session_state.conversation_id = str(uuid.uuid4())
     # 账号标识只来自服务端令牌，浏览器状态里不保存用户 id。

@@ -98,6 +98,7 @@ def test_register_login_persist_history_and_isolate_users(monkeypatch, request, 
             headers=headers,
             json={
                 "query": "请诊断我的持仓组合",
+                "research_mode": "deep",
                 "profile": {"user_id": "untrusted-client-value", "risk_level": "R5", "confirmed": True, "version": 2},
                 "facts": [
                     {

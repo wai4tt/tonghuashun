@@ -51,9 +51,13 @@ def _text(fact):
     return fact.value if isinstance(fact.value, str) else json.dumps(fact.value, ensure_ascii=False, sort_keys=True)
 
 
+STOCK_RECOMMENDATION_TIMEOUT_SECONDS = 120
+
+
 class StockRecommendationService:
     def __init__(self, pipeline: AutomatedResearchPipeline, coordinator: CoordinatorAgent, *,
-                 max_candidates: int = 10, concurrency: int = 2, timeout_seconds: float = 120):
+                 max_candidates: int = 10, concurrency: int = 2,
+                 timeout_seconds: float = STOCK_RECOMMENDATION_TIMEOUT_SECONDS):
         self.pipeline, self.coordinator = pipeline, coordinator
         self.max_candidates = max(1, min(20, max_candidates))
         self.concurrency = max(1, min(4, concurrency))
@@ -402,27 +406,33 @@ class StockRecommendationService:
             return entry, None, req.facts, audits
         candidate_understanding = understanding.model_copy(update={"action": "analyze", "target": code,
                                                                   "data_requirements": []})
-        advice = await self.coordinator.run(req, understanding=candidate_understanding)
-        if agent_requirements(advice.agent_results):
+        repaired = False
+        async def recover_before_review(provisional):
+            nonlocal req, repaired
+            if not agent_requirements(provisional.agent_results):
+                return req
             recovered, repair = await recover_research(
-                self.pipeline, req, Intent.SECURITY_RESEARCH, advice, self._audit(audits, req.facts),
+                self.pipeline, req, Intent.SECURITY_RESEARCH, provisional, self._audit(audits, req.facts),
                 target=code, semantic=self.coordinator.semantic,
             )
             repair = repair.model_copy(update={"recovery_attempts": [
                 {**attempt, "scope": code} for attempt in repair.recovery_attempts]})
             if recovered is not req:
                 req = recovered
-                advice = await self.coordinator.run(req, understanding=candidate_understanding)
+                repaired = True
                 repair = repair.model_copy(update={"recovery_reanalyzed": True})
-                entry.missing_fields = missing_fields_by_agent(req.facts, Intent.SECURITY_RESEARCH,
-                                                               now=self.pipeline.now())
-                fit, fit_reason, fit_ids = self._fit(req, name, conditions)
-                if fit != "yes":
-                    entry.status = "excluded" if fit == "no" else "review"
-                    entry.reasons = [fit_reason]
-                    audits.append(repair)
-                    return entry, advice, req.facts, audits
             audits.append(repair)
+            return req
+        advice = await self.coordinator.run(req, understanding=candidate_understanding,
+                                           recovery_hook=recover_before_review)
+        if repaired:
+            entry.missing_fields = missing_fields_by_agent(req.facts, Intent.SECURITY_RESEARCH,
+                                                           now=self.pipeline.now())
+            fit, fit_reason, fit_ids = self._fit(req, name, conditions)
+            if fit != "yes":
+                entry.status = "excluded" if fit == "no" else "review"
+                entry.reasons = [fit_reason]
+                return entry, advice, req.facts, audits
         security = next((r for r in advice.agent_results if r.agent_id == "security"), None)
         if security is not None:
             security.facts_used = sorted(set(security.facts_used + fit_ids + entry.evidence))

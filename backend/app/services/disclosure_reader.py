@@ -11,12 +11,23 @@ from pathlib import Path
 from urllib.parse import urlsplit, urljoin
 
 import httpx
+from backend.app.http_clients import verified_ssl_context
 
 from backend.app.models import FactRecord
 from backend.app.services.provider_errors import ProviderCallError
+from backend.app.services.model_response_cache import ModelResponseCache
 
 PDF_HOSTS = frozenset({'static.cninfo.com.cn', 'www.cninfo.com.cn', 'dataclouds.cninfo.com.cn',
     'www.sse.com.cn', 'static.sse.com.cn', 'www.szse.cn', 'www.bse.cn', 'disclosure.szse.cn', 'www.neeq.com.cn'})
+
+# URLs are never assumed immutable: download anew on each sequential read.
+# Only concurrent downloads and extraction of byte-identical documents coalesce.
+_downloads = ModelResponseCache(ttl_seconds=0, max_entries=16)
+_extractions = ModelResponseCache(ttl_seconds=600, max_entries=32)
+
+
+async def close_document_caches():
+    await asyncio.gather(_downloads.aclose(), _extractions.aclose())
 
 
 def canonical_disclosure_url(url):
@@ -40,8 +51,18 @@ def allowed_disclosure_url(url):
         return False
 
 
-async def extract_pdf(data):
-    process = await asyncio.create_subprocess_exec(sys.executable, str(Path(__file__).with_name('pdf_text_worker.py')),
+async def extract_pdf(data, *, focus=None):
+    key = f'PDF_TEXT_V1:{focus or "general"}:' + hashlib.sha256(data).hexdigest()
+    arguments = (data, focus) if focus else (data,)
+    result, _ = await _extractions.get(key, lambda: _extract_pdf(*arguments),
+        cacheable=lambda value: isinstance(value, dict) and bool(value.get('identity') and value.get('pages')),
+        cancel_if_unused=True)
+    return result
+
+
+async def _extract_pdf(data, focus=None):
+    arguments = [focus] if focus else []
+    process = await asyncio.create_subprocess_exec(sys.executable, str(Path(__file__).with_name('pdf_text_worker.py')), *arguments,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         **({'creationflags': subprocess.CREATE_NO_WINDOW} if sys.platform == 'win32' else {}))
     try:
@@ -70,15 +91,12 @@ async def read_disclosure(source, *, code, name, client=None, extractor=extract_
         return [mirror, *excerpts] if excerpts else []
 
 
-async def _read_disclosure(source, *, code, name, client=None, extractor=extract_pdf):
-    if (not source.source_url or not source.period or not allowed_disclosure_url(source.source_url)
-            or source.entity != name or (source.entity_code and str(source.entity_code).split('.')[0] != code)):
-        return []
+async def _download_pdf(url, client=None):
     owned = client is None
-    client = client or httpx.AsyncClient(timeout=8, follow_redirects=False,
+    client = client or httpx.AsyncClient(timeout=8, follow_redirects=False, verify=verified_ssl_context(),
         headers={'User-Agent': 'Mozilla/5.0', 'Accept': 'application/pdf'})
     try:
-        url, data = source.source_url, bytearray()
+        data = bytearray()
         for hop in range(3):
             async with client.stream('GET', url) as response:
                 if response.is_redirect:
@@ -97,7 +115,23 @@ async def _read_disclosure(source, *, code, name, client=None, extractor=extract
                 break
         if not data.startswith(b'%PDF-'):
             raise ProviderCallError('公告地址未返回PDF正文。', code='DOCUMENT_NOT_PDF')
-        result = await extractor(bytes(data))
+        return bytes(data)
+    finally:
+        if owned:
+            await client.aclose()
+
+
+async def _read_disclosure(source, *, code, name, client=None, extractor=extract_pdf):
+    if (not source.source_url or not source.period or not allowed_disclosure_url(source.source_url)
+            or source.entity != name or (source.entity_code and str(source.entity_code).split('.')[0] != code)):
+        return []
+    try:
+        if client is None:
+            data, _ = await _downloads.get(source.source_url, lambda: _download_pdf(source.source_url),
+                                           cacheable=lambda _: False, cancel_if_unused=True)
+        else:
+            data = await _download_pdf(source.source_url, client)
+        result = await extractor(data)
         identity = result.get('identity', '')
         # A link labelled as this security is insufficient when the PDF itself
         # identifies a different company. Require identity in its opening pages.
@@ -124,6 +158,3 @@ async def _read_disclosure(source, *, code, name, client=None, extractor=extract
                                 status_code=exc.response.status_code) from exc
     except httpx.RequestError as exc:
         raise ProviderCallError('公告原文网络连接失败。', code='DOCUMENT_NETWORK_ERROR') from exc
-    finally:
-        if owned:
-            await client.aclose()

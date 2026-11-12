@@ -19,6 +19,7 @@ from frontend.presentation import collaboration_rows, source_trace_rows
 def request():
     return OrchestrationRequest(
         query="请诊断我的持仓组合", profile={"risk_level": "R3", "confirmed": True},
+        research_mode="deep",
         auto_fetch=False, facts=[FactRecord(
             fact_id="ACCEPT-WEIGHT", entity="合成ETF", field="weight", value=0.2,
             snapshot_time=datetime.now(timezone.utc), source_id="SYNTHETIC_ACCEPTANCE", quality=0.95,

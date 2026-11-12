@@ -20,6 +20,7 @@ from frontend.streamlit_app import (
 def offline_research_board(monkeypatch):
     """界面回归不访问开发环境的真实问财服务；专用数据面板测试另行覆盖。"""
     from frontend import streamlit_app as ui
+    monkeypatch.setattr(ui, "render_prepared_stock_report", lambda base: None)
     monkeypatch.setattr(ui, "create_board_fetch", lambda base: lambda base, direction, target: {
         "direction": direction, "target": target, "status": "unavailable", "sections": [], "fetched_at": None,
     })
@@ -495,6 +496,90 @@ with patch.object(ui, 'submit_chat_analysis', side_effect=fake_submit):
     assert app.session_state['sent']['auto_fetch'] is True
 
 
+@pytest.mark.parametrize("outcome", ["approved", "review", "empty", "timeout"])
+def test_stock_recommendation_uses_background_research_and_handles_outcome(outcome):
+    from frontend.api_client import ApiResult
+
+    script = SETUP + """
+from concurrent.futures import Future
+st.session_state.profile['confirmed'] = True
+if 'recommendation_future' not in st.session_state:
+    ui.activate_research('个股研究')
+    st.session_state.research_direction = '个股研究'
+    st.session_state.facts = [{'fact_id': 'existing', 'entity': '原有资料', 'field': 'news', 'value': '原有资料'}]
+    st.session_state.recommendation_future = Future()
+    st.session_state.recommendation_requests = []
+class FakeExecutor:
+    def submit(self, function, client, base, method, path, payload, token, progress):
+        st.session_state.recommendation_requests.append((method, path, payload))
+        return st.session_state.recommendation_future
+with patch.object(ui, 'analysis_executor', return_value=FakeExecutor()), patch.object(ui, 'backend_http_client', return_value=object()):
+    if st.session_state.pop('submit_recommendation', False):
+        from backend.app.research_routing import PROFILE_STOCK_RECOMMENDATION_QUERY
+        ui.submit_chat_analysis('http://localhost', '个股研究', PROFILE_STOCK_RECOMMENDATION_QUERY, recommend_stocks=True)
+    ui.finish_chat_analyses()
+    ui.page_questions('http://localhost')
+    ui._background_analysis_status()
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    app.session_state["submit_recommendation"] = True
+    app.run(timeout=15)
+    assert not app.exception
+    assert not any(button.key == "recommend_stocks" for button in app.button)
+    assert app.chat_input[0].disabled
+    app.run(timeout=15)
+    [(method, path, payload)] = app.session_state["recommendation_requests"]
+    assert (method, path) == ("POST", "/portfolio/analyze")
+    assert payload["research_mode"] == "deep" and payload["research_direction"] == "个股研究"
+    assert payload["query"].startswith("个股研究：") and "推荐" in payload["query"]
+    assert payload["auto_fetch"] and payload["profile"]["confirmed"]
+    assert payload["research_target"] is None and not payload["facts"] and not payload["context_messages"]
+    assert app.session_state["research_mode"] == "instant"
+
+    if outcome == "timeout":
+        result = ApiResult(status=504, detail="本次研究超过时间预算，请稍后重试。")
+    else:
+        status = "PASS" if outcome == "approved" else "REVIEW"
+        candidate = {"symbol": "600001", "name": "测试候选", "status": "recommended",
+                     "reasons": ["测试原因"], "risks": ["测试风险"], "snapshot_time": "2026-11-06T00:00:00Z"}
+        candidates = [candidate] if outcome != "empty" else []
+        result = ApiResult(data={
+            "conclusion": "建议关注测试候选" if status == "PASS" else "核验未通过，暂无推荐。",
+            "compliance": {"status": status}, "cross_validation": {"status": status},
+            "facts": [{"fact_id": "candidate-only", "entity": "测试候选", "field": "news", "value": "候选资料"}],
+            "stock_recommendation": {"candidates": candidates, "recommendations": candidates},
+        })
+    app.session_state["recommendation_future"].set_result(result)
+    app.run(timeout=15)
+    assert not app.exception
+    assert not any(button.key == "recommend_stocks" for button in app.button)
+    assert not app.chat_input[0].disabled
+    assert not app.session_state["analysis_jobs"]
+    assert [fact["fact_id"] for fact in app.session_state["facts"]] == ["existing"]
+
+    if outcome == "timeout":
+        assert len(app.session_state["conversation"]) == 1
+        assert any("超过时间预算" in notice.value for notice in app.info)
+        return
+    answer = app.session_state["conversation"][-1]["payload"]
+    assert answer["facts"][0]["fact_id"] == "candidate-only"
+    if outcome != "approved":
+        assert any("暂无通过核验" in notice.value for notice in app.info)
+    if outcome != "empty":
+        candidates_table = next(frame.value for frame in app.dataframe if "代码" in frame.value.columns)
+        assert candidates_table.iloc[0]["代码"] == "600001"
+        assert candidates_table.iloc[0]["结果"] == ("通过核验" if outcome == "approved" else "待复核")
+
+
+def test_stock_recommendation_button_is_absent_from_research_pages():
+    app = AppTest.from_string(SETUP + "ui.page_questions('http://localhost')").run(timeout=15)
+    assert not any(button.key == "recommend_stocks" for button in app.button)
+    app.segmented_control[0].select("个股研究").run(timeout=15)
+    assert not app.exception
+    assert not any(button.key == "recommend_stocks" for button in app.button)
+
+
 def test_five_research_pages_isolate_history_evidence_and_new_conversation():
     script = SETUP + """
 st.session_state.profile['confirmed'] = True
@@ -553,6 +638,7 @@ def test_background_answer_returns_to_originating_research_direction():
 from concurrent.futures import Future
 from frontend.api_client import ApiResult
 st.session_state.profile['confirmed'] = True
+st.session_state.research_mode = 'deep'
 future = st.session_state.setdefault('async_future', Future())
 class FakeExecutor:
     def submit(self, *args):
@@ -578,6 +664,32 @@ with patch.object(ui, 'analysis_executor', return_value=FakeExecutor()), \
     assert not app.exception
     assert len(app.session_state['conversation']) == 2
     assert app.session_state['conversation'][1]['content'] == '市场分析已完成'
+
+
+def test_research_mode_only_offers_three_seconds_and_deep():
+    script = SETUP + """
+from concurrent.futures import Future
+st.session_state.profile['confirmed'] = True
+future = st.session_state.setdefault('mode_future', Future())
+st.session_state.setdefault('mode_requests', [])
+class FakeExecutor:
+    def submit(self, function, client, base, method, path, payload, token, progress):
+        st.session_state.mode_requests.append(payload)
+        return future
+with patch.object(ui, 'analysis_executor', return_value=FakeExecutor()), \
+     patch.object(ui, 'preview_executor', return_value=FakeExecutor()), \
+     patch.object(ui, 'backend_http_client', return_value=object()):
+    ui.page_questions('http://localhost')
+"""
+    app = AppTest.from_string(script).run(timeout=15)
+    assert not app.exception
+    mode = next(widget for widget in app.segmented_control if widget.label == '研究模式')
+    assert mode.options == ['3秒研究', '深度思考']
+    assert mode.value == 'instant'
+    mode.select('深度思考').run(timeout=15)
+    app.chat_input[0].set_value('分析市场').run(timeout=15)
+    assert not app.exception
+    assert app.session_state['mode_requests'][-1]['research_mode'] == 'deep'
 
 
 def test_details_uses_selected_result_evidence_not_current_materials():

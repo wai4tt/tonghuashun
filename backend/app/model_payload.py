@@ -2,7 +2,61 @@
 from __future__ import annotations
 
 from typing import Any
+from copy import deepcopy
 from backend.app.models import AgentResult, FactRecord, UserProfile
+
+
+_REFERENCE_FIELDS = frozenset({"fact_id", "facts_used", "derived_from", "evidence_id"})
+_LITERAL_FIELDS = frozenset({"value", "normalized_value", "quote"})
+
+
+def rewrite_fact_references(value: Any, mapping: dict[str, str], *, reference: bool = False) -> Any:
+    """Rewrite reference fields only; source values and quoted evidence stay literal."""
+    if isinstance(value, str):
+        return mapping.get(value, value) if reference else value
+    if isinstance(value, list):
+        return [rewrite_fact_references(item, mapping, reference=reference) for item in value]
+    if isinstance(value, dict):
+        return {key: deepcopy(item) if key in _LITERAL_FIELDS else
+                rewrite_fact_references(item, mapping, reference=key in _REFERENCE_FIELDS)
+                for key, item in value.items()}
+    return value
+
+
+def compact_fact_references(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    """Use short model-local IDs, returning the inverse map for normal validation.
+
+    Cache identity must still use the original payload. Never shorten references
+    to absent facts or change evidence text, numbers, dates, units or source URLs.
+    """
+    facts = payload.get("authorized_facts") or []
+    reserved: set[str] = set()
+
+    def collect(value: Any, reference: bool = False) -> None:
+        if isinstance(value, str) and reference:
+            reserved.add(value)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, reference)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                if key not in _LITERAL_FIELDS:
+                    collect(item, key in _REFERENCE_FIELDS)
+
+    collect(payload)
+    aliases: dict[str, str] = {}
+    index = 1
+    for fact in facts:
+        fact_id = fact.get("fact_id")
+        if not isinstance(fact_id, str) or len(fact_id) <= 12 or fact_id in aliases:
+            continue
+        while f"f{index}" in reserved:
+            index += 1
+        alias = f"f{index}"
+        aliases[fact_id] = alias
+        reserved.add(alias)
+        index += 1
+    return rewrite_fact_references(payload, aliases), {alias: original for original, alias in aliases.items()}
 
 
 def _without_empty_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -27,6 +81,18 @@ def profile_for_model(profile: UserProfile, *, exclude: set[str] | None = None) 
             for reason in data.get("assessment_reasons", [])
         ]
     return _without_empty_fields(data)
+
+
+def profile_for_routing(profile: UserProfile) -> dict[str, Any]:
+    """Intent/risk routing needs suitability signals, not full financial or trade history.
+
+    This view is used only before research. Specialists, scoring and final review
+    continue to receive the full profile and questionnaire evidence.
+    """
+    fields = {"confirmed", "risk_level", "constraints", "target", "preferred_product_types",
+              "suitable_product_levels", "horizon_months", "investment_horizon_label",
+              "liquidity_need", "loss_tolerance_label", "max_drawdown", "financial_warnings"}
+    return _without_empty_fields(profile.model_dump(mode="json", include=fields))
 
 
 def fact_for_model(fact: FactRecord) -> dict[str, Any]:

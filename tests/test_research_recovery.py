@@ -24,6 +24,7 @@ def facts_for(agent, *, omitted=()):
 
 def request(facts):
     return OrchestrationRequest(query="请研究示例科技这只个股",
+                                research_mode="deep",
                                 profile={"confirmed": True, "risk_level": "R3"}, facts=facts)
 
 

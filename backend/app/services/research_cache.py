@@ -128,7 +128,8 @@ class ResearchFactCache:
                             facts = await loader()
                     else:
                         facts = await loader()
-                    if facts and all(fact_is_current(fact, now()) for fact in facts):
+                    if (self.pending.get(key) is asyncio.current_task() and facts
+                            and all(fact_is_current(fact, now()) for fact in facts)):
                         self.entries[key] = [fact.model_copy(deep=True) for fact in facts]
                         self.entries.move_to_end(key)
                         if force_refresh:

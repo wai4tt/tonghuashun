@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from collections import defaultdict
-import math
+from backend.app.numeric import finite_number
 
 from backend.app.fact_taxonomy import fact_is_current
 from backend.app.models import FactRecord, Intent
@@ -29,9 +29,8 @@ def missing_fields_by_agent(facts: list[FactRecord], intent: Intent, *, now: dat
     by_entity: dict[str, set[str]] = defaultdict(set)
     current = now or datetime.now(timezone.utc)
     for fact in facts:
-        if (fact_is_current(fact, current) and isinstance(fact.value, (int, float))
-                and not isinstance(fact.value, bool) and math.isfinite(fact.value)
-                and 0 <= fact.value <= 100):
+        value = finite_number(fact.value)
+        if fact_is_current(fact, current) and value is not None and 0 <= value <= 100:
             by_entity[fact.entity].add(fact.field.casefold())
     gaps = {}
     for agent in INTENT_AGENTS.get(intent, ()):

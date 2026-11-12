@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 from backend.app.models.schemas import DataOverviewRequest, DataOverviewResponse, DataOverviewSection
+from backend.app.services.provider_errors import ProviderCallError
 
 STOCK_UNIVERSE = "贵州茅台、宁德时代、招商银行、中国平安、美的集团、长江电力"
 INDEX_UNIVERSE = "上证指数、深证成指、创业板指、沪深300"
@@ -24,17 +26,20 @@ def overview_jobs(provider: Any, request: DataOverviewRequest) -> list:
             ("news", "市场资讯", lambda: provider.get_news("最近3天A股市场政策与宏观经济，最多6条")),
         ]
     elif direction == "industry":
+        query = (f"{target} 行业板块的板块简称、板块代码、涨跌幅、成交额、主力资金净流入、市盈率TTM、市净率，注明行情日期"
+                 if target else "板块筛选：同花顺行业板块，最新涨跌幅排名前8，显示板块简称、板块代码、涨跌幅、成交额、主力资金净流入、市盈率")
         jobs = [
             ("overview", "行业表现", lambda: provider.query(
-                "板块筛选：同花顺行业板块，最新涨跌幅排名前8，显示板块简称、板块代码、涨跌幅、成交额、主力资金净流入、市盈率", limit=8, skill_id="hithink-astock-selector")),
-            ("news", "行业资讯", lambda: provider.get_news("最近3天行业政策与产业动态，最多6条")),
+                query, limit=8, skill_id="hithink-industry-query" if target else "hithink-astock-selector")),
+            ("news", "行业资讯", lambda: provider.get_news(
+                f"最近3天{target or ''}行业政策与产业动态，最多6条")),
         ]
     elif direction == "stock":
         jobs = [
             ("overview", "股票行情", lambda: provider.query(
-                f"{STOCK_UNIVERSE}的股票简称、股票代码、最新价、涨跌幅、成交额、总市值、市盈率TTM、市净率、所属行业", limit=6)),
-            ("detail", "财务指标", lambda: provider.get_financial_metrics(target)),
-            ("company", "公司资料", lambda: provider.get_basic_info(target)),
+                f"{target}的股票简称、股票代码、最新价、涨跌幅、成交额、总市值、市盈率TTM、市净率、所属行业", limit=6)),
+            ("detail", "财务指标", lambda: scoped_snapshot(provider, "get_financial_metrics", target)),
+            ("company", "公司资料", lambda: scoped_snapshot(provider, "get_basic_info", target)),
             ("history", "近30期收盘价", lambda: provider.get_price_history(target, asset_type="股票", limit=30)),
         ]
     elif direction == "fund":
@@ -46,15 +51,25 @@ def overview_jobs(provider: Any, request: DataOverviewRequest) -> list:
         if target:
             jobs.append(("history", "近30期单位净值", lambda: provider.get_price_history(target, asset_type="基金", limit=30)))
     else:
-        query_target = target or "当前正常交易的可转债，按最近交易日成交额从高到低前8只"
+        # 问财会把冗长的排序、状态和指标描述一起当作筛选条件，导致正常行情返回零行。
+        # 条数由 API 的 limit 控制；缺失的指标在页面上明确显示为缺失。
+        query = (f"{target} 可转债最新价、涨跌幅、转股溢价率" if target else
+                 "可转债按成交额从高到低前8只，最新价、涨跌幅、转股溢价率")
         jobs = [
             ("overview", "可转债数据", lambda: provider.query(
-                f"{query_target}，显示可转债简称、可转债代码、最新价、涨跌幅、成交额、转股溢价率、纯债溢价率、到期收益率、剩余规模、债券评级、转股价，最多8只", limit=8)),
+                query, limit=8)),
         ]
         if target:
             jobs.append(("history", "近30期收盘价", lambda: provider.get_price_history(target, asset_type="可转债", limit=30)))
 
     return jobs
+
+
+async def scoped_snapshot(provider, method, target):
+    """Mark exact capability results so research can reuse the same batch."""
+    facts = await getattr(provider, method)(target)
+    scope = re.sub(r"\s+", "", target.strip()).casefold()
+    return [fact.model_copy(update={"produced_by": f"{method}@{scope}"}) for fact in facts]
 
 
 async def load_section(provider, key, title, call):
@@ -65,6 +80,8 @@ async def load_section(provider, key, title, call):
         facts = [fact for fact in facts if fact.field != "provider_response"]
         return DataOverviewSection(key=key, title=title, status="ok" if facts else "empty", facts=facts[:500],
                                    message=None if facts else "问财本次未返回可展示的结构化数据。")
+    except ProviderCallError as exc:
+        return DataOverviewSection(key=key, title=title, status="unavailable", message=str(exc))
     except (RuntimeError, TimeoutError, ValueError):
         return DataOverviewSection(key=key, title=title, status="unavailable", message="本栏问财数据暂未取得，请稍后刷新。")
 

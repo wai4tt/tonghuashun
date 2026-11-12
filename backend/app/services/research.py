@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from backend.app.numeric import finite_number
+
 import asyncio
 import os
 import json
@@ -657,19 +659,7 @@ def _latest_numeric(facts: list[FactRecord], now: datetime) -> tuple[FactRecord,
 
 
 def _number(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value) if math.isfinite(value) else None
-    if isinstance(value, str):
-        match = re.fullmatch(r"[-+]?\d[\d,]*(?:\.\d+)?", value.strip())
-        if match:
-            try:
-                number = float(match.group(0).replace(",", ""))
-                return number if math.isfinite(number) else None
-            except ValueError:
-                return None
-    return None
+    return finite_number(value, allow_text=True)
 
 
 def _clamp(value: float) -> float:

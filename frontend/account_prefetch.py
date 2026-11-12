@@ -4,7 +4,6 @@ import streamlit as st
 from concurrent.futures import ThreadPoolExecutor
 
 from frontend.api_client import request_json
-from frontend import research_board
 
 
 PENDING = object()
@@ -46,7 +45,7 @@ def discard_account_result(api_base: str, path: str) -> None:
 
 def start_account_prefetch(api_base: str, token: str | None, client: httpx.Client) -> None:
     cancel_account_prefetch()
-    executor = research_board.board_prefetch_executor()
+    executor = account_read_executor()
     st.session_state.account_prefetch = {
         (api_base, path): executor.submit(request_json, client, api_base, "GET", path, None, token)
         for path in ("/profile", "/history?limit=20", "/watchlist")

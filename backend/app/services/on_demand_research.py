@@ -256,7 +256,8 @@ async def assess_gap_evidence(pipeline, request, intent, target, semantic, *, ti
     targets = assessment_targets(pipeline, request, intent, target)
     if not targets:
         return request, "not_required", []
-    selected = select_assessment_documents(current_facts(pipeline, request), targets)
+    selected = select_assessment_documents(current_facts(pipeline, request), targets,
+                                           max_per_entity=6 if request.research_mode == "fast" else 12)
     if not selected or not callable(getattr(semantic, "assess_stock_evidence", None)):
         return request, "unavailable", targets
     if timeout_seconds is not None and timeout_seconds <= 0:
@@ -305,7 +306,7 @@ async def assess_gap_evidence(pipeline, request, intent, target, semantic, *, ti
     return enriched, "completed" if len(added) == len(targets) else "partial", targets
 
 
-def select_assessment_documents(facts, targets):
+def select_assessment_documents(facts, targets, *, max_per_entity=12):
     """Deduplicate title/summary pairs and reserve relevant material for each rubric."""
     grouped = {}
     for fact in facts:
@@ -326,10 +327,10 @@ def select_assessment_documents(facts, targets):
         for dimension in dimensions:
             relevant = sorted(docs, key=lambda f: (
                 sum(term in f.value for term in DIMENSION_TERMS[dimension]), _date(f), f.fact_id), reverse=True)
-            for fact in relevant[:max(1, 12 // len(dimensions))]:
+            for fact in relevant[:max(1, max_per_entity // len(dimensions))]:
                 selected[fact.fact_id] = fact
         for fact in sorted(docs, key=lambda f: (_date(f), f.fact_id), reverse=True):
-            if len(selected) >= 12:
+            if len(selected) >= max_per_entity:
                 break
             selected[fact.fact_id] = fact
         output.extend(selected.values())
@@ -342,6 +343,11 @@ async def read_gap_documents(pipeline, request, intent, target, fetched, *, time
     if timeout_seconds is not None and timeout_seconds <= 0:
         return [], [], [], [], {}
     jobs, seen = [], set()
+    # Keep identity and original quotes; an already verified report does not need
+    # another download/extraction merely because a second recovery phase starts.
+    verified = [f for f in current_facts(pipeline, request)
+                if f.source_id == "OFFICIAL_DISCLOSURE_PDF_V1" and f.field == "announcement_excerpt"
+                and (f.derivation_rule or '').startswith('PDF_TEXT_V1:')]
     # Prefer relevant original reports by actual publication date, not retrieval time.
     titles = {f.source_url: str(f.value) for f in fetched if f.field == 'announcement'}
     def document_rank(f):
@@ -363,6 +369,10 @@ async def read_gap_documents(pipeline, request, intent, target, fetched, *, time
                 seen.add(source.source_url)
                 source = next((f for f in fetched if f.source_url == source.source_url
                                and f.entity == name and f.field == 'announcement'), source)
+                if any(f.entity == name and f.source_url == source.source_url and f.period == source.period
+                       and str(f.entity_code or '').split('.')[0] == code
+                       and source.fact_id in f.derived_from for f in verified):
+                    continue
                 jobs.append((f"disclosure_pdf:{len(jobs)}", source, code, name))
     jobs = jobs[:2]
     async def read(source, code, name):

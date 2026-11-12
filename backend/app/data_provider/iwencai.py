@@ -23,6 +23,7 @@ from backend.app.services.call_tracking import calling_user_id
 from backend.app.services.provider_errors import ProviderCallError
 
 import httpx
+from backend.app.http_clients import verified_ssl_context
 
 from backend.app.fact_taxonomy import METADATA_FIELD_NAMES
 from backend.app.models import FactRecord
@@ -47,7 +48,7 @@ SKILL_KEY_ENV = {
 }
 
 # Invalidate persistent facts after changing official skill routes or field contracts.
-SKILL_CONTRACT_REVISION = "2026-10-04.3"
+SKILL_CONTRACT_REVISION = "2026-11-02.1"
 
 
 # 实体名由 _entity_from_record 从这些字段提取并写入 FactRecord.entity，
@@ -353,6 +354,7 @@ class IwencaiSkillHubProvider:
         # Provider 是应用级单例；复用一个异步客户端才能真正复用 TCP/TLS 连接池。
         # 每次调用仍生成独立追踪 ID，并保留原有超时、重试和熔断语义。
         self._client = httpx.AsyncClient(transport=transport, timeout=timeout_seconds,
+            verify=verified_ssl_context() if transport is None else True,
             limits=httpx.Limits(max_connections=max_concurrency, max_keepalive_connections=max_concurrency))
         self.call_observer: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._failure_count = 0
@@ -675,8 +677,29 @@ class IwencaiSkillHubProvider:
 
     async def get_market_breadth(self, target: str) -> list[FactRecord]:
         facts = await self.query('同花顺全A(沪深京)指数 最新上涨家数、成份股总数、统计日期，两项统计范围及日期一致', entity_hint=target)
-        # Only the explicitly queried all-A index can represent this China scope.
-        return [f.model_copy(update={'entity': target}) if f.entity_code == '883957.TI' else f for f in facts]
+        # Only this all-A index and the two exact source columns describe the
+        # requested population. Expression columns (e.g. advancing+total) must
+        # not be mistaken for one of their constituent indicators.
+        output = []
+        for fact in facts:
+            if fact.entity_code != '883957.TI':
+                continue
+            raw = re.sub(r"\[[^]]*]", "", fact.source_field or fact.field).strip()
+            raw = raw.removeprefix("指数@")
+            field = ({"上涨家数": "advancing_count", "A股总家数": "market_total_count",
+                      "成分股总数": "market_total_count", "成份股总数": "market_total_count"}.get(raw))
+            if not fact.source_field and fact.field in {"advancing_count", "market_total_count"}:
+                field = fact.field
+            if field is None or isinstance(fact.value, bool):
+                continue
+            try:
+                value = float(str(fact.value).replace(",", "").strip())
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or not value.is_integer() or value < 0:
+                continue
+            output.append(fact.model_copy(update={"entity": target, "field": field, "value": value}))
+        return output
 
     async def get_industry_flow(self, industry: str) -> list[FactRecord]:
         from backend.app.data_provider.industry_evidence import industry_query_name
@@ -742,6 +765,13 @@ class IwencaiSkillHubProvider:
             f"{symbol} 最新财报的市盈率、市净率、ROE、营业收入同比增长率",
             entity_hint=symbol,
             skill_id="hithink-finance-query",
+        )
+
+    async def get_annual_financial_metrics(self, symbol: str, year: int) -> list[FactRecord]:
+        return await self.query(
+            f"{symbol} {year}年12月31日合并年报的营业收入（元）、归母净利润（元）、"
+            "营业收入同比增长率、归母净利润同比增长率、净资产收益率和加权净资产收益率，逐项注明报告期和单位",
+            entity_hint=symbol, skill_id="hithink-finance-query",
         )
 
     async def get_news(self, query: str) -> list[FactRecord]:
@@ -857,6 +887,12 @@ class IwencaiSkillHubProvider:
             f"{target} 最新上市公司公告",
             channel="announcement",
             entity_hint=target,
+        )
+
+    async def get_annual_report(self, symbol: str, year: int, name: str) -> list[FactRecord]:
+        return await self._comprehensive_search(
+            f"{name}（{symbol}）的{year}年年度报告全文，{year + 1}年披露的正式年度报告",
+            channel="announcement", entity_hint=name,
         )
 
     async def get_governance_disclosures(self, target: str) -> list[FactRecord]:
@@ -1076,7 +1112,7 @@ def _percentage_unit(field: str, source_field: str, record: Mapping[str, Any], *
             return currency or declared_currency
         match = re.search(r"[\[(（](人民币|港元|港币|美元|CNY|HKD|USD|元)[\])）]", source_field)
         return currencies.get(match[1]) if match else None
-    if field in {"capital_flow", "turnover_value", "avg_turnover_20d", "interval_avg_turnover"}:
+    if field in {"capital_flow", "turnover_value", "avg_turnover_20d", "interval_avg_turnover", "revenue", "net_profit"}:
         if declared in {"CNY", "元", "万元", "亿元"}:
             return "CNY" if declared == "元" else declared
         match = re.search(r"[\[(（](亿元|万元|元)[\])）]", source_field)

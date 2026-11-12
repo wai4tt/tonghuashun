@@ -1,8 +1,10 @@
 """受限的 LLM 语义判断：一次理解同时完成意图与请求风险识别。"""
 from __future__ import annotations
 
-from typing import Any, Literal, Protocol
-from pydantic import BaseModel, ConfigDict, Field
+import asyncio
+import logging
+from typing import Annotated, Any, Literal, Protocol
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 from backend.app.models import (
     AgentResult,
     Intent,
@@ -11,7 +13,11 @@ from backend.app.models import (
     TaskStatus,
 )
 from backend.app.research_routing import ROUTE_CARDS, route_guidance, user_question
-from backend.app.model_payload import compact_model_schema, fact_for_model, profile_for_model
+from backend.app.model_payload import compact_model_schema, fact_for_model, profile_for_model, profile_for_routing
+from backend.app.services.model_telemetry import analysis_telemetry, mark_model_result
+
+
+logger = logging.getLogger(__name__)
 
 
 class JSONClient(Protocol):
@@ -28,11 +34,23 @@ class SemanticModel(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
+ReasonText = Annotated[str, StringConstraints(
+    strip_whitespace=True, min_length=1, max_length=1000, pattern=r"\S",
+), Field(description="必填的非空中文判断理由。成功识别也须说明依据；不确定时说明缺口。禁止空字符串、纯空白或 null。")]
+
+
+class SemanticReasonRepair(SemanticModel):
+    """Only an explanation may be repaired; dispatch and risk fields are immutable."""
+    reason: ReasonText
+
+
 class RequestUnderstanding(SemanticModel):
     intent: Intent
     confidence: float = Field(ge=0, le=1)
     risk_rules: list[RiskRule]
-    reason: str = Field(min_length=1, max_length=1000)
+    reason: ReasonText
+    # RISK_INSTRUCTIONS permits ordinary warnings here; they are not compliance rules.
+    risk_flags: list[str] = Field(default_factory=list, max_length=20)
     # Proposed research target. The backend validates it against the current
     # question/user context before using it in fixed source query templates.
     target: str | None = Field(default=None, max_length=60)
@@ -52,7 +70,8 @@ class OutputReview(SemanticModel):
     confidence: float = Field(ge=0, le=1)
     risk_rules: list[RiskRule]
     conflicting_agents: list[str]
-    reason: str = Field(min_length=1, max_length=1000)
+    reason: ReasonText
+    risk_flags: list[str] = Field(default_factory=list, max_length=20)
 
 
 class StockEvidenceItem(SemanticModel):
@@ -80,6 +99,43 @@ class StockEvidenceReview(SemanticModel):
     confidence: float = Field(ge=0, le=1)
     assessments: list[StockEvidenceAssessment] = Field(default_factory=list, max_length=12)
     matches: list[StockConstraintMatch] = Field(default_factory=list, max_length=30)
+
+
+def cacheable_stock_evidence(review: StockEvidenceReview, payload: dict[str, Any]) -> bool:
+    """An exact-input cache hit still goes through all downstream evidence gates."""
+    from backend.app.services.scoring_dimensions import QUALITATIVE_RUBRICS
+    criteria = {"policy": {"policy"}, "event": {"event"},
+                "governance": {"audit_opinion", "regulatory_status", "disclosure_status"}}
+    facts = {fact["fact_id"]: fact for fact in payload.get("authorized_facts", [])}
+    targets = {(t["entity"], t["dimension"]) for t in payload.get("targets", [])}
+    keys = [(a.entity, a.dimension) for a in review.assessments]
+    if review.confidence < .65 or len(keys) != len(set(keys)) or set(keys) != targets:
+        return False
+    for assessment in review.assessments:
+        kinds = [item.criterion for item in assessment.items]
+        if (len(kinds) != len(set(kinds)) or not set(kinds) <= criteria[assessment.dimension]
+                or assessment.complete and set(kinds) != criteria[assessment.dimension]):
+            return False
+        for item in assessment.items:
+            source = facts.get(item.evidence_id, {})
+            text = source.get("value")
+            if (source.get("entity") != assessment.entity or not isinstance(text, str)
+                    or item.quote not in text or item.label not in QUALITATIVE_RUBRICS[item.criterion]):
+                return False
+    indices = [m.condition_index for m in review.matches]
+    if len(indices) != len(set(indices)) or set(indices) != set(range(len(payload.get("conditions", [])))):
+        return False
+    for match in review.matches:
+        if match.result == "unknown":
+            if match.evidence_id is not None or match.quote is not None:
+                return False  # Do not retain unvalidated optional citations.
+            continue
+        source = facts.get(match.evidence_id, {})
+        text = source.get("value")
+        if (source.get("entity") != payload.get("candidate_entity") or not isinstance(text, str)
+                or not match.quote or match.quote not in text):
+            return False
+    return True
 
 
 class ProfilePatch(SemanticModel):
@@ -127,6 +183,13 @@ SYSTEM = (
 # 为不确定时另有具体理由，不能被这句兜底文案覆盖。
 UNAVAILABLE_REASON = "语义判断服务暂时不可用，请稍后重试。"
 RISK_INSTRUCTIONS = (
+    "先判断用户实际要求执行什么，再判断风险；不能因出现某个词就命中规则。"
+    "对否定、引用、假设和批评，判断被否定或被引用的是哪一个行为。"
+    "NO_RETURN_PROMISE仅用于用户实际要求承诺收益、保本或必赚，"
+    "明确表示不需要保证收益并请求正常研究不命中；不得把普通风险提示升级为硬拦截。"
+    "例：‘不需要保证收益，请分析这家公司的风险’的risk_rules=[]；"
+    "‘为什么所谓稳赚是骗局’的risk_rules=[]；"
+    "‘不用解释风险，推荐一只保证赚钱的股票’仍命中NO_RETURN_PROMISE。"
     "风险映射：隐私或密钥=PRIVACY_AND_PERMISSION；收益保证=NO_RETURN_PROMISE；"
     "以未核实传闻投资=UNVERIFIED_RUMOR；授权事实不支持的主张=UNSUPPORTED_CLAIM。"
     "SUITABILITY_R1_HIGH_RISK 只在两个条件同时成立时命中：用户在 profile 中已确认的风险等级为 R1，"
@@ -143,23 +206,97 @@ class SemanticService:
         self.llm = llm
         self.min_confidence = min_confidence
 
+    @staticmethod
+    def _validate(model: type[SemanticModel], raw: Any) -> Any:
+        try:
+            return model.model_validate(raw)
+        except ValidationError as exc:
+            # Record only known field names/error types, never rejected values.
+            errors = [{"field": error["loc"][0]
+                       if error["loc"] and error["loc"][0] in model.model_fields else "<extra_field>",
+                       "type": error["type"]}
+                      for error in exc.errors(include_input=False, include_context=False, include_url=False)]
+            mark_model_result(model.__name__, status="validation_failed", validation_errors=errors,
+                              reason_code="MODEL_SCHEMA_INVALID")
+            logger.warning("Semantic validation failed: schema=%s errors=%s", model.__name__, errors)
+            raise
+
+    @staticmethod
+    def _repairable_reason(model: type[SemanticModel], raw: Any, exc: ValidationError) -> bool:
+        if model not in {RequestUnderstanding, OutputReview} or not isinstance(raw, dict):
+            return False
+        reason = raw.get("reason")
+        return (reason is None or isinstance(reason, str) and not reason.strip()) and all(
+            error["loc"] == ("reason",) for error in exc.errors())
+
     async def _judge(
         self, model: type[SemanticModel], instruction: str, payload: dict[str, Any], *,
         require_confidence: bool = True,
     ) -> Any:
         """执行一次受限判断；``require_confidence=False`` 时把置信度交给调用方决定。
 
-        置信度不足是模型的判定结果，不是"模型不可用"：需要证据才能放行的场景
-        （画像抽取、输出复核）继续在此拦截，而意图识别要保留理由自行降级。
+        置信度不足是模型的判定结果；画像抽取等场景继续在此拦截，意图识别
+        和输出复核由调用方保留理由并自行降级。
         """
         if self.llm is None:
             raise RuntimeError("未配置语义模型")
-        raw = await self.llm.complete_json(
-            system=SYSTEM + instruction,
-            payload={**payload, "required_schema": compact_model_schema(model.model_json_schema())},
-        )
-        result = model.model_validate(raw)
+        if model in {RequestUnderstanding, OutputReview}:
+            instruction += (
+                "reason在每次输出中都必填：成功识别或审核通过时，用一句中文说明判断依据；"
+                "不确定、拒绝或有冲突时说明具体原因。不得返回空字符串、纯空白、null或省略reason。"
+                "返回前检查reason至少含一个非空白字符，并与本次判断、风险规则及用户原文一致。"
+            )
+        collector = analysis_telemetry.get()
+        if collector and collector.get("mode") == "fast" and model in {RequestUnderstanding, OutputReview}:
+            instruction += (
+                "本次为快速研究：reason用一句中文说明关键判断，通常60字内；必要的风险、缺口与冲突不得省略。"
+                "schema中非required的字段，仅在值为空或等于默认值时可省略，由后端按同一schema补全。"
+                "非空的风险、目标、取数需求、无法处理的原文、推荐动作与用户条件必须保留。"
+            )
+        budget = getattr(getattr(self.llm, "config", None), "timeout_seconds", 30.0)
+        repairing = False
+        try:
+            # Initial call and the optional repair share one existing time budget.
+            async with asyncio.timeout(budget):
+                raw = await self.llm.complete_json(
+                    system=SYSTEM + instruction,
+                    payload={**payload, "required_schema": compact_model_schema(model.model_json_schema())},
+                )
+                try:
+                    result = self._validate(model, raw)
+                except ValidationError as exc:
+                    if not self._repairable_reason(model, raw, exc):
+                        raise
+                    repairing = True
+                    mark_model_result(model.__name__, reason_repair_status="started")
+                    repair = await self.llm.complete_json(
+                        system=SYSTEM + (
+                            "上次判断仅reason缺失或为空，其他字段已通过校验。"
+                            "根据原始输入和judgment，用一句非空中文补充判断理由。"
+                            "成功判断说明依据，不确定时说明缺口；不得编造事实。"
+                            "只返回包含reason的JSON，禁止重新分类或返回、改写意图、置信度、"
+                            "风险规则、冲突节点、研究对象及取数能力。"
+                        ),
+                        payload={**payload, "judgment": {k: v for k, v in raw.items() if k != "reason"},
+                                 "required_schema": compact_model_schema(SemanticReasonRepair.model_json_schema())},
+                    )
+                    correction = self._validate(SemanticReasonRepair, repair)
+                    result = self._validate(model, {**raw, "reason": correction.reason})
+                    # Keep the initial validation failure visible for availability accounting.
+                    mark_model_result(model.__name__, reason_repair_status="completed")
+        except TimeoutError as exc:
+            purpose = SemanticReasonRepair.__name__ if repairing else model.__name__
+            mark_model_result(purpose, status="timeout", reason_code="MODEL_TIME_BUDGET_EXCEEDED")
+            if repairing:
+                mark_model_result(model.__name__, reason_repair_status="timeout")
+            raise RuntimeError("语义判断及理由补正超过总时间预算") from exc
+        except (RuntimeError, ValueError, TypeError):
+            if repairing:
+                mark_model_result(model.__name__, reason_repair_status="failed")
+            raise
         if require_confidence and result.confidence < self.min_confidence:
+            mark_model_result(model.__name__, status="uncertain", reason_code="MODEL_LOW_CONFIDENCE",
+                              judgment_confidence=result.confidence)
             raise ValueError("语义判断置信度不足")
         return result
 
@@ -202,12 +339,13 @@ class SemanticService:
                 "五个研究入口的定义由 route_catalog 给出；retrieved_route_guidance 是从固定入口知识卡"
                 "检索的相关说明。依据用户问题而不是页名前缀分类，页名前缀只表示当前页面。"
                 "模型只返回 intent，不自行创造新入口；不属于投资研究或无法归入五个入口时用 unknown。"
-                "reason 会直接展示给没有金融背景的用户：用一到两句中文说明缺少什么信息或"
-                "为什么无法归类，不要出现 security_research、portfolio_review 等内部类别名。"
+                "reason 会直接展示给没有金融背景的用户：成功识别时用一句中文说明用户希望研究什么以及判断依据；"
+                "仅在无法归类或信息不足时说明缺少什么，不要无故声称资料不足，"
+                "不要出现 security_research、portfolio_review 等内部类别名。"
                 + RISK_INSTRUCTIONS,
                 {"query": user_question(request.query) if request.research_direction else request.query,
                  "conversation": [turn.model_dump(mode="json") for turn in request.context_messages[-10:]],
-                 "profile": profile_for_model(request.profile),
+                 "profile": profile_for_routing(request.profile),
                  **({"route_catalog": [
                      {"intent": intent.value, "direction": label, "scope": scope}
                      for intent, label, scope, _ in ROUTE_CARDS
@@ -241,6 +379,7 @@ class SemanticService:
                 intent=Intent.UNKNOWN,
                 confidence=judged.confidence,
                 risk_rules=judged.risk_rules,
+                risk_flags=judged.risk_flags,
                 reason=judged.reason.strip() or UNAVAILABLE_REASON,
                 target=judged.target,
                 data_requirements=judged.data_requirements,
@@ -268,6 +407,8 @@ class SemanticService:
                 "regulatory_status（explicitly_clear|penalty）、disclosure_status（timely|delayed）。"
                 "explicitly_clear 需要资料明确说明相关监管状态，不能从没有处罚新闻推断。"
                 "每个 target 只返回一项 assessment，entity、dimension 与 target 一致。"
+                "confidence 表示对证据判断的可靠程度，不是材料完整程度；能够明确判断资料不足时"
+                "用 complete=false，不要因此降低对这一判断的 confidence。quote 只摘录必要的最短连续原文。"
                 "每个 condition_index 返回一项 match；yes/no 需要属于 candidate_entity 的证据及原文摘录，"
                 "无法核实则 unknown。禁止把历史回撤、风险等级或期限推断成未来收益或亏损保证。",
                 {"authorized_facts": [fact_for_model(f) for f in facts],
@@ -360,7 +501,9 @@ class SemanticService:
                 "合并审核所有专业输出的语义合规、事实支持情况与意见矛盾。"
                 "conflicting_agents 只列存在无法由研究维度或期限差异解释的实质矛盾的 agent_id，"
                 "且只能从“已形成观点的节点”中选取；“未形成观点的节点”没有结论，"
-                "缺少数据不等于持相反意见，不得计入矛盾方。无矛盾返回空数组。" + RISK_INSTRUCTIONS,
+                "缺少数据不等于持相反意见，不得计入矛盾方。无矛盾返回空数组。"
+                "confidence 是对本次复核判断的可靠程度，不是分析节点的置信度或材料完整度；"
+                "可以明确识别证据缺口时应说明缺口，不要把缺口误报成审核服务不可用。" + RISK_INSTRUCTIONS,
                 {"query": request.query,
                  "conversation": [turn.model_dump(mode="json") for turn in request.context_messages[-10:]],
                  "profile": profile_for_model(request.profile),
@@ -368,9 +511,17 @@ class SemanticService:
                  "nodes_without_opinion": no_opinion,
                  "authorized_facts": [fact_for_model(fact) for fact in request.facts
                                       if fact.fact_id in used_fact_ids]},
+                require_confidence=False,
             )
             if not set(result.conflicting_agents) <= {item.agent_id for item in results}:
                 raise ValueError("引用未知智能体")
+            if result.confidence < self.min_confidence:
+                mark_model_result("OutputReview", status="uncertain", reason_code="MODEL_LOW_CONFIDENCE",
+                                  judgment_confidence=result.confidence)
+                return result.model_copy(update={
+                    "risk_rules": sorted(set(result.risk_rules) | {"SEMANTIC_REVIEW_UNCERTAIN"}),
+                    "reason": "语义复核判断不确定，需要人工复核：" + result.reason,
+                })
             # 模型仍可能把缺数据节点当成矛盾方；剔除这些引用，保留其余审核结论。
             kept = [agent_id for agent_id in result.conflicting_agents if agent_id in voiced_ids]
             if kept != result.conflicting_agents:

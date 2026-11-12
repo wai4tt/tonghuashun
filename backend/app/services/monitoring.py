@@ -26,16 +26,27 @@ class ServiceMetrics:
         self.analysis_failure_count = 0
         self.analysis_within_target_count = 0
         self.analysis_outcomes: dict[str, int] = {}
+        self.lite_count = 0
+        self.lite_within_target_count = 0
+        self.instant_count = 0
+        self.instant_within_target_count = 0
 
-    def record_analysis(self, elapsed_ms: float, outcome: str) -> None:
-        """仅统计完整分析；REVIEW/BLOCK 与异常分开，不用健康检查稀释延迟。"""
+    def record_analysis(self, elapsed_ms: float, outcome: str, *, scope: str = "full") -> None:
+        """咨询范围分别计数；REVIEW/BLOCK 与异常分开，不用健康检查稀释延迟。"""
         self.analysis_count += 1
         self.analysis_latencies_ms.append(elapsed_ms)
         self.analysis_outcomes[outcome] = self.analysis_outcomes.get(outcome, 0) + 1
         if outcome == "ERROR":
             self.analysis_failure_count += 1
-        elif outcome in {"PASS", "REVIEW", "BLOCK"} and elapsed_ms <= 3_000:
-            self.analysis_within_target_count += 1
+        elif outcome in {"PASS", "REVIEW", "BLOCK"}:
+            if scope == "instant":
+                self.instant_count += 1
+                self.instant_within_target_count += elapsed_ms < 3_000
+            elif scope == "lite":
+                self.lite_count += 1
+                self.lite_within_target_count += elapsed_ms <= 3_000
+            elif scope == "full" and elapsed_ms <= 3_000:
+                self.analysis_within_target_count += 1
 
     def record(self, status_code: int, elapsed_ms: float) -> None:
         self.request_count += 1
@@ -72,12 +83,16 @@ class ServiceMetrics:
                 "failure_count": self.analysis_failure_count,
                 "outcomes": dict(self.analysis_outcomes),
                 "within_3_seconds_count": self.analysis_within_target_count,
+                "completed_instant_count": self.instant_count,
+                "completed_instant_within_3_seconds_count": self.instant_within_target_count,
+                "completed_lite_count": self.lite_count,
+                "completed_lite_within_3_seconds_count": self.lite_within_target_count,
                 "latency_sample_count": len(self.analysis_latencies_ms),
                 "p50_latency_ms": self._percentile(list(self.analysis_latencies_ms), 0.50),
                 "p95_latency_ms": self._percentile(list(self.analysis_latencies_ms), 0.95),
                 "p99_latency_ms": self._percentile(list(self.analysis_latencies_ms), 0.99),
                 "max_latency_ms": round(max(self.analysis_latencies_ms), 2) if self.analysis_latencies_ms else None,
-                "scope": "analysis_handler_including_history_save_excluding_auth_and_transport",
+                "scope": "analysis_handler_full_awaits_history_lite_queues_history_excluding_auth_and_transport",
             },
         }
 

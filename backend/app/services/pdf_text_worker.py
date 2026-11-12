@@ -14,11 +14,13 @@ FOCUS = {
     'disclosure': ('按规定披露定期报告', '及时披露', '延期披露', '信息披露违规', '定期报告', '未按规定披露'),
     'event': ('业绩预告', '权益分派', '股份回购', '股权质押', '限售', '重大事项'),
 }
-KEYWORDS = tuple(word for words in FOCUS.values() for word in words)
 
 
 def main():
     started = time.monotonic()
+    focus_groups = ({"financial": ("主要会计数据", "合并利润表", "营业收入", "归属于上市公司股东的净利润")}
+                    if sys.argv[1:] == ["financial"] else FOCUS)
+    keywords = tuple(word for words in focus_groups.values() for word in words)
     data = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
     if len(data) > 8 * 1024 * 1024 or not data.startswith(b'%PDF-'):
         return
@@ -31,7 +33,7 @@ def main():
         for item in items:
             if isinstance(item, list):
                 yield from outline_pages(item)
-            elif any(word in str(getattr(item, 'title', '')) for word in KEYWORDS):
+            elif any(word in str(getattr(item, 'title', '')) for word in keywords):
                 try:
                     destination = reader.get_destination_page_number(item)
                     yield from range(max(0, destination - 1), min(len(reader.pages), destination + 3))
@@ -57,10 +59,10 @@ def main():
             pages.append({'page': index + 1, 'text':text})
     selected, seen = [], set()
     # Keep evidence for each dimension; audit boilerplate cannot take all slots.
-    for focus, words in FOCUS.items():
+    for focus, words in focus_groups.items():
         relevant = sorted((item for item in pages if any(word in item['text'] for word in words)),
             key=lambda item:(-(words[0] in item['text']), -sum(item['text'].count(word) for word in words), item['page']))
-        for item in relevant[:2]:
+        for item in relevant[:6 if focus == 'financial' else 2]:
             offset = max(0, min(item['text'].find(word) for word in words if word in item['text']) - 1000)
             excerpt = item['text'][offset:offset+6000]
             key = (item['page'], excerpt)

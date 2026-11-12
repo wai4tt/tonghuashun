@@ -2,9 +2,12 @@
 from __future__ import annotations
 from functools import partial
 from typing import Any
+import re
+from urllib.parse import urlsplit, urlunsplit
 import streamlit as st
+from frontend.research_report import render_research_report, report_sections
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
-from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, TOPIC_LABELS)
+from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, friendly_fact_rows, TOPIC_LABELS)
 from frontend.presentation import render_verification_records
 from frontend.investment_panel import render_investment_panel, investment_summary
 from frontend.answer_visibility import coverage_notices, verification_notes, visible_risks, visible_next_steps, visible_risk_conclusion, visible_compliance_reason
@@ -49,11 +52,92 @@ def _download_pdf(advice, question):
     return build_answer_pdf(answer_export_payload(advice, answer_images(advice), question))
 
 
+def render_stock_recommendation(advice: dict[str, Any]) -> None:
+    report = advice.get("stock_recommendation")
+    if not report:
+        return
+    candidates = report.get("candidates") or []
+    passed = (advice.get("compliance") or {}).get("status") == "PASS" and (
+        advice.get("cross_validation") or {}).get("status") == "PASS"
+    recommended = {item["symbol"] for item in report.get("recommendations") or []
+                   if passed and item.get("status") == "recommended"}
+    if not recommended:
+        st.info("本次暂无通过核验的推荐股票，原因见分析结论。")
+    if not candidates:
+        return
+    with st.expander("候选股票核验记录", icon=":material/fact_check:"):
+        st.caption(f"本次核验 {len(candidates)} 只候选股票，其中 {len(recommended)} 只进入推荐名单。")
+        st.dataframe([
+            {
+                "代码": candidate["symbol"],
+                "名称": candidate["name"],
+                "结果": "通过核验" if candidate["symbol"] in recommended else
+                        "未入选" if candidate.get("status") == "excluded" else "待复核",
+                "理由": "。".join(plain_language(reason) for reason in candidate.get("reasons") or []),
+                "主要风险": "。".join(plain_language(risk) for risk in candidate.get("risks") or []),
+                "资料日期": str(candidate.get("snapshot_time") or "")[:10],
+            }
+            for candidate in candidates
+        ], hide_index=True, width="stretch")
+
+
+def render_automatic_answer(advice: dict[str, Any]) -> None:
+    st.write(plain_language(advice.get("conclusion")))
+    ids = advice.get("answer_fact_ids") or advice.get("evidence") or []
+    verified = set(advice.get("evidence") or [])
+    facts = {fact["fact_id"]: fact for fact in advice["facts"] if fact.get("fact_id") in verified}
+    rows = []
+    for index, fact_id in enumerate(ids, start=1):
+        if fact_id not in facts:
+            continue
+        fact = facts[fact_id]
+        row = friendly_fact_rows([fact])[0]
+        if fact.get("field") in {"revenue", "net_profit", "close_price"} and fact.get("unit"):
+            unit = "元" if fact["unit"] == "CNY" else fact["unit"]
+            row["内容 / 数值"] = f"{fact['value']} {unit}"
+        if fact.get("entity_code"):
+            row["对象"] = f"{row['对象']} · {fact['entity_code']}"
+        page = re.search(r"第\s*(\d+)\s*页", str(fact.get("source_field") or ""))
+        if page:
+            row["原文页码"] = page[1]
+        try:
+            link = urlsplit(fact.get("source_url") or "")
+            if link.scheme in {"http", "https"} and link.hostname and not link.username:
+                if page and link.path.lower().endswith(".pdf"):
+                    link = link._replace(fragment=f"page={page[1]}")
+                row["原文"] = urlunsplit(link)
+        except ValueError:
+            pass
+        rows.append(row if advice.get("source_reference") else {"编号": index, **row})
+    if rows:
+        st.dataframe(rows, hide_index=True, width="stretch",
+                     column_config={"原文": st.column_config.LinkColumn(display_text="打开来源")})
+    if (advice.get("cross_validation") or {}).get("issues"):
+        st.caption("存在相同口径下数值不一致的资料，相关指标已撤下。")
+    acquisition = advice.get("data_acquisition") or {}
+    if acquisition.get("mode") == "unavailable" or acquisition.get("reason_code") == "PROVIDER_QUOTA_EXHAUSTED":
+        st.caption(acquisition.get("message") or "部分资料暂不可用，可稍后重试。")
+
+
 def render_advice(advice: dict[str, Any], *, export_key: str = "answer", question: str = "", compact: bool = False) -> None:
     """最近回答优先展示结论与图表；历史回答折叠细节，重要风险始终可见。"""
     advice = {**advice, "facts": list(advice.get("facts") or [])}
     compliance = advice.get("compliance") or {}
     acquisition = advice.get("data_acquisition") or {}
+    if (advice.get("prepared_report") or {}).get("reused"):
+        generated = advice["prepared_report"].get("generated_at", "")
+        st.caption(f"完整深入报告已于 {generated} 完成分析及审核；本次核对资料与投资偏好后复用。")
+    if advice.get("scope_notice"):
+        st.caption(advice["scope_notice"])
+    if advice.get("history_status") == "pending":
+        st.caption("咨询记录稍后可在历史记录中查看。")
+    if (advice.get("research_mode") == "auto" and compliance.get("status") != "BLOCK"
+            and (advice.get("answer_fact_ids") or advice.get("source_reference") or advice.get("response_scope") == "clarification")):
+        render_automatic_answer(advice)
+        render_research_report(advice, key=export_key, compact=compact)
+        if advice.get("evidence"):
+            _render_pdf_download(advice, question, export_key)
+        return
     notices = []
     if compliance.get("status") != "PASS":
         notices.append("这份分析仍需核实，请勿直接据此买卖。")
@@ -83,19 +167,34 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
                 render_investment_panel(advice, key=export_key)
                 render_answer_charts(advice, key=export_key)
                 render_logic_chain(advice)
-                render_source_trace(advice)
+                render_source_trace(advice, key=f"sources_{export_key}")
         render_verification_records(advice, key=export_key)
     else:
         render_conclusion_panel(advice, key=f"analysis-conclusion-{export_key}")
-        render_answer_charts(advice, key=export_key)
+        if advice.get("prepared_report"):
+            with st.expander("查看完整报告图表", key=f"prepared_charts_{export_key}", on_change="rerun") as charts:
+                if charts.open:
+                    render_answer_charts(advice, key=export_key)
+        elif advice.get("response_scope", "full") == "full":
+            render_answer_charts(advice, key=export_key)
+        else:
+            with st.expander("查看已有资料图表", key=f"lite_charts_{export_key}", on_change="rerun") as charts:
+                if charts.open:
+                    render_answer_charts(advice, key=export_key)
         with st.expander("分析过程与分项依据", key=f"answer_analysis_{export_key}", on_change="rerun", icon=":material/account_tree:") as details:
             if details.open:
                 render_logic_chain(advice)
-        render_source_trace(advice)
+        render_source_trace(advice, key=f"sources_{export_key}")
+    render_research_report(advice, key=export_key, compact=compact)
+    render_stock_recommendation(advice)
     if acquisition.get("reused_capabilities"):
         st.caption("本次沿用了仍在有效期内的已有资料。")
     if acquisition.get("reason_code") == "MODEL_UNAVAILABLE":
         st.caption("智能研判暂不可用，本次采用可复算的规则结果。")
+    _render_pdf_download(advice, question, export_key)
+
+
+def _render_pdf_download(advice, question, export_key):
     st.download_button("导出这条回答为 PDF", data=partial(_download_pdf, advice, question),
         file_name="问策智投_投资研究回答.pdf", mime="application/pdf", key=f"answer_pdf_{export_key}",
         icon=":material/picture_as_pdf:", on_click="ignore")
@@ -119,6 +218,7 @@ def answer_export_payload(advice: dict[str, Any], images: list, question: str = 
         ("后续研究建议", visible_next_steps(advice)),
         ("与您的投资偏好是否匹配", [advice.get("user_fit")]),
     ]
+    sections.extend(report_sections(advice))
     sections.extend(investment_summary(advice))
     for result in advice.get("agent_results", []):
         sections.append((TOPIC_LABELS.get(result.get("agent_id"), "相关分析"),

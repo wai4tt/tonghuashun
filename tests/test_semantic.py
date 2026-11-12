@@ -25,9 +25,11 @@ from backend.app.models import (
 )
 from backend.app.semantic import UNAVAILABLE_REASON, SemanticService
 from backend.app.services.profile import assess_profile
+from backend.app.services.model_telemetry import analysis_telemetry
 
 
 def request(query="不用保证收益，解释一下这种说法为什么不可信", **kwargs):
+    kwargs.setdefault("research_mode", "deep")
     return OrchestrationRequest(query=query, profile={"user_id": "test", "confirmed": True}, **kwargs)
 
 
@@ -88,11 +90,51 @@ async def test_intent_is_model_result_with_context_and_no_keyword_override():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("flags", [[], ["估值和波动需要进一步核实"]])
+async def test_understanding_accepts_risk_flags_without_changing_risk_rules(flags):
+    semantic, calls = service({**understanding("security_research"), "risk_flags": flags})
+    result = await semantic.understand(request("分析下贵州茅台"))
+    assert result.intent is Intent.SECURITY_RESEARCH
+    assert result.risk_flags == flags
+    assert result.risk_rules == []
+    payload = json.loads(calls[0]["messages"][1]["content"])
+    schema = payload["required_schema"]
+    assert schema["properties"]["risk_flags"]["type"] == "array"
+    assert "risk_flags" not in schema["required"]
+    assert schema["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_preserves_risk_flags():
+    flags = ["研究对象尚需确认"]
+    semantic, _ = service({**understanding(confidence=0.5), "risk_flags": flags})
+    result = await semantic.understand(request())
+    assert result.intent is Intent.UNKNOWN
+    assert result.confidence == 0.5
+    assert result.risk_flags == flags
+    assert result.reason != UNAVAILABLE_REASON
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flags", [[], ["资料仍需核实"]])
+async def test_output_review_accepts_risk_flags(flags):
+    semantic, _ = service({"confidence": 0.95, "risk_rules": [],
+                           "conflicting_agents": [], "reason": "无实质矛盾", "risk_flags": flags})
+    result = await semantic.review(request(), [])
+    assert result is not None
+    assert result.risk_flags == flags
+    assert result.risk_rules == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("content", [
     understanding("buy_now"),
     {**understanding(), "confidence": float("nan")},
     {**understanding(), "risk_rules": ["RUN_SHELL"]},
     {**understanding(), "confirmed": True}, [], None, {},
+    {**understanding(), "risk_flags": "not a list"},
+    {**understanding(), "risk_flags": [123]},
+    {**understanding(), "risk_flags": ["warning"] * 21},
 ])
 async def test_invalid_intent_output_returns_unknown_without_guessing(content):
     """模型没有给出可用判定（枚举非法、数值越界、多余字段）时才视为不可用。"""
@@ -102,6 +144,43 @@ async def test_invalid_intent_output_returns_unknown_without_guessing(content):
     assert result.confidence == 0
     assert result.reason == UNAVAILABLE_REASON
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_validation_failure_records_field_and_type_without_private_values(caplog):
+    private_value = "PRIVATE_INVALID_CONFIDENCE"
+    semantic, _ = service({**understanding(), "confidence": private_value})
+    telemetry = {"calls": []}
+    token = analysis_telemetry.set(telemetry)
+    try:
+        result = await semantic.understand(request("PRIVATE_QUERY"))
+    finally:
+        analysis_telemetry.reset(token)
+    assert result.intent is Intent.UNKNOWN
+    call = telemetry["calls"][0]
+    assert call["status"] == "validation_failed"
+    assert call["validation_errors"] == [{"field": "confidence", "type": "float_parsing"}]
+    assert private_value not in caplog.text
+    assert "PRIVATE_QUERY" not in caplog.text
+    assert private_value not in json.dumps(telemetry["calls"])
+
+
+@pytest.mark.asyncio
+async def test_validation_diagnostic_does_not_log_model_supplied_extra_field_names(caplog):
+    private_key = "PRIVATE_MODEL_SUPPLIED_KEY"
+    semantic, _ = service({**understanding(), private_key: "PRIVATE_VALUE"})
+    telemetry = {"calls": []}
+    token = analysis_telemetry.set(telemetry)
+    try:
+        result = await semantic.understand(request())
+    finally:
+        analysis_telemetry.reset(token)
+    assert result.intent is Intent.UNKNOWN
+    assert telemetry["calls"][0]["validation_errors"] == [
+        {"field": "<extra_field>", "type": "extra_forbidden"},
+    ]
+    assert private_key not in caplog.text
+    assert "PRIVATE_VALUE" not in caplog.text
 
 
 @pytest.mark.asyncio

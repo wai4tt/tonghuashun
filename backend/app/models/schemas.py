@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+from .research_report import ResearchReport
 
 from backend.app.risk_questionnaire import validate_answers
 
@@ -389,18 +390,24 @@ class OrchestrationRequest(BaseModel):
     """进入主协调智能体的单次请求输入。"""
 
     # 原始用户问题，禁止为空字符串，避免无意义调用专业智能体。
-    query: str = Field(min_length=1)
+    query: str = Field(min_length=1, max_length=20000)
     # 五个研究页显式传入当前入口；未传时保留通用 API 的原有行为。
     research_direction: Literal["市场解读", "行业分析", "个股研究", "基金筛选", "可转债分析"] | None = None
+    # 页面选择只用于解析“当前标的”；明确提到的证券仍以本次问题为准。
+    research_target: str | None = Field(default=None, max_length=60)
     # 当前已加载的用户画像版本。
     profile: UserProfile
     # 数据层在本次请求中已授权的事实集合。
-    facts: list[FactRecord] = Field(default_factory=list)
+    facts: list[FactRecord] = Field(default_factory=list, max_length=4000)
     # 默认由后端按意图自动补充真实数据；显式关闭时只使用调用方提供的事实。
     auto_fetch: bool = True
-    research_mode: Literal["fast", "deep"] = "deep"
+    # Lite/instant complete bounded local reviews; deep is the legacy online API.
+    # fast remains accepted for clients using the earlier deadline-only mode.
+    research_mode: Literal["lite", "instant", "fast", "deep", "auto"] = "lite"
+    # A progressive-page preview is transient; only the final research is stored.
+    preview_only: bool = False
     # 用户授权导入的持仓快照；真实系统还应增加权限与敏感字段脱敏。
-    portfolio: list[dict[str, Any]] = Field(default_factory=list)
+    portfolio: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     # 最近对话由客户端显式传入，既支持多轮理解，也避免服务端跨用户串话。
     conversation_id: str | None = Field(default=None, max_length=128)
     context_messages: list["ConversationTurn"] = Field(default_factory=list, max_length=20)
@@ -410,9 +417,15 @@ class OrchestrationRequest(BaseModel):
     def query_must_contain_visible_text(cls, value: str) -> str:
         """去除首尾空白并拒绝纯空白问题，避免创建无意义的执行计划。"""
         normalized = value.strip()
-        if not normalized:
+        if not any(char.isalnum() for char in normalized):
             raise ValueError("query 不能为空或仅包含空白字符")
         return normalized
+
+    @model_validator(mode="after")
+    def local_input_budget(self):
+        if self.research_mode in {"lite", "instant", "auto"} and len(self.query) > 2000:
+            raise ValueError("3秒咨询的问题请控制在2000字以内")
+        return self
 
     @field_validator("facts")
     @classmethod
@@ -500,7 +513,7 @@ class DataFetchRequest(BaseModel):
     @classmethod
     def target_must_contain_visible_text(cls, value: str) -> str:
         normalized = value.strip()
-        if not normalized:
+        if not any(char.isalnum() for char in normalized):
             raise ValueError("target 不能为空")
         return normalized
 
@@ -559,7 +572,7 @@ class PriceHistoryRequest(BaseModel):
     @classmethod
     def target_must_contain_visible_text(cls, value: str) -> str:
         normalized = value.strip()
-        if not normalized:
+        if not any(char.isalnum() for char in normalized):
             raise ValueError("target 不能为空")
         return normalized
 
@@ -592,7 +605,7 @@ class ConversationTurn(BaseModel):
     @classmethod
     def content_must_contain_visible_text(cls, value: str) -> str:
         normalized = value.strip()
-        if not normalized:
+        if not any(char.isalnum() for char in normalized):
             raise ValueError("对话内容不能为空")
         return normalized
 
@@ -649,6 +662,9 @@ class DataAcquisitionResult(BaseModel):
     cached_capabilities: list[str] = Field(default_factory=list)
     # 分析前与 agent 研判后各最多补取一次，防止无限重试。
     recovery_rounds: int = Field(default=0, ge=0, le=2)
+    # All recovery phases share one budget; specialist time is accounted separately.
+    recovery_elapsed_ms: float = Field(default=0, ge=0)
+    recovery_budget_exhausted: bool = False
     recovery_phases: list[Literal["before_analysis", "after_analysis"]] = Field(default_factory=list, max_length=2)
     recovery_attempts: list[dict[str, Any]] = Field(default_factory=list, max_length=2)
     recovery_agent_requirements: dict[str, list[ResearchCapability]] = Field(default_factory=dict)
@@ -728,7 +744,15 @@ class AdvicePackage(BaseModel):
     timings_ms: dict[str, float] = Field(default_factory=dict)
     model_calls: list[dict[str, Any]] = Field(default_factory=list)
     model_cost: dict[str, Any] = Field(default_factory=dict)
-    research_mode: Literal["fast", "deep"] = "deep"
+    research_mode: Literal["lite", "instant", "fast", "deep", "auto"] = "deep"
+    response_scope: Literal["full", "snapshot", "evidence_review", "education", "clarification"] = "full"
+    scope_notice: str | None = None
+    omitted_features: list[str] = Field(default_factory=list)
+    history_status: Literal["not_requested", "pending", "stored", "unavailable"] = "not_requested"
+    research_report: ResearchReport | None = None
+    prepared_report: dict[str, Any] | None = None
+    answer_fact_ids: list[str] = Field(default_factory=list)
+    source_reference: str | None = None
     # 用于决定展示模板和后续追问策略的意图。
     intent: Intent
     # 本次使用的已确认画像版本，供界面及历史记录核对。
@@ -765,6 +789,8 @@ class AdvicePackage(BaseModel):
     # 单独保留一致性审查，避免把专业分歧藏进一个平均分。
     cross_validation: CrossValidationResult = Field(default_factory=CrossValidationResult)
     stock_recommendation: StockRecommendationResult | None = None
+    # 回答中数字与所引事实的对账结果（数值级幻觉检测）；为空表示本次未核验。
+    numeric_grounding: dict[str, Any] | None = None
 
 
 class SnapshotOptions(BaseModel):
@@ -804,3 +830,46 @@ class ComparisonResponse(BaseModel):
     fetched_at: datetime
     status: Literal["ok", "partial", "empty", "unavailable", "loading"]
     items: list[ComparisonItem] = Field(default_factory=list)
+
+
+class PortfolioHoldingInput(BaseModel):
+    """组合优化入参的一条持仓。
+
+    ``weight`` 与 ``shares``+``price`` 二选一：前者是用户直接给出的比例，
+    后者按市值占比换算，换算过程在响应里回显，便于核对。
+    """
+
+    symbol: str = Field(min_length=1, max_length=60)
+    name: str | None = Field(default=None, max_length=60)
+    industry: str | None = Field(default=None, max_length=40)
+    weight: float | None = Field(default=None, ge=0, le=1)
+    shares: float | None = Field(default=None, ge=0)
+    price: float | None = Field(default=None, ge=0, le=1_000_000)
+    volatility: float | None = Field(default=None, ge=0, le=5)
+
+    @model_validator(mode="after")
+    def require_measure(self) -> "PortfolioHoldingInput":
+        if self.weight is None and not (self.shares and self.price):
+            raise ValueError("每条持仓需要 weight，或同时提供 shares 与 price")
+        return self
+
+
+class PortfolioPlanRequest(BaseModel):
+    """组合诊断/再平衡请求；全部为算术输入，不触发大模型调用。"""
+
+    holdings: list[PortfolioHoldingInput] = Field(min_length=1, max_length=30)
+    asset_type: Literal["股票", "基金", "可转债"] = "股票"
+    include_price_history: bool = True
+    price_history_days: Literal[30, 60] = 60
+    single_limit: float | None = Field(default=None, gt=0, le=1)
+    industry_limit: float | None = Field(default=None, gt=0, le=1)
+    rebalance_threshold: float = Field(default=0.02, ge=0, le=0.25)
+    total_value: float | None = Field(default=None, gt=0, le=1e12)
+    risk_level: str | None = Field(default=None, max_length=20)
+
+
+class GroundingCheckRequest(BaseModel):
+    """把一段回答与一组事实做数值对账（对外暴露的幻觉检测入口）。"""
+
+    text: str = Field(min_length=1, max_length=20_000)
+    facts: list[FactRecord] = Field(default_factory=list, max_length=400)

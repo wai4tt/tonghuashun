@@ -82,6 +82,7 @@ def test_portfolio_analysis_returns_auditable_advice_package() -> None:
         "/api/v1/portfolio/analyze",
         json={
             "query": "请诊断我的持仓组合",
+            "research_mode": "deep",
             "profile": {"user_id": "u-api", "risk_level": "R3", "confirmed": True},
             "facts": [
                 {

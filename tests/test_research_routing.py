@@ -26,6 +26,7 @@ class RouteLLM:
 def research_request(direction: str, question: str) -> OrchestrationRequest:
     return OrchestrationRequest(
         query=f"{direction}：{question}", research_direction=direction,
+        research_mode="deep",
         profile={"user_id": "test", "confirmed": True},
     )
 

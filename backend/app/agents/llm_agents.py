@@ -12,6 +12,7 @@ import json
 import math
 import hashlib
 import os
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 from time import perf_counter
@@ -20,11 +21,15 @@ import httpx
 from pydantic import ValidationError
 
 from backend.app.agents.base import BaseAgent
+from backend.app.http_clients import verified_ssl_context
 from backend.app.agents.rule_agents import make_rule_agents
 from backend.app.models import AgentResult, OrchestrationRequest, TaskStatus
-from backend.app.services.model_telemetry import analysis_telemetry
+from backend.app.services.model_telemetry import analysis_telemetry, model_call_for, mark_model_result
 from backend.app.services.model_input import slice_facts_for_agent
-from backend.app.model_payload import baseline_for_model, fact_for_model, profile_for_model
+from backend.app.model_payload import (
+    baseline_for_model, fact_for_model, profile_for_model,
+    compact_fact_references, rewrite_fact_references,
+)
 from backend.app.services.agent_data_requirements import AGENT_DATA_CAPABILITIES
 from backend.app.services.model_response_cache import ModelResponseCache
 
@@ -56,6 +61,8 @@ class LLMConfig:
     input_price_per_million: float | None = None
     output_price_per_million: float | None = None
     cache_ttl_seconds: float = 120
+    # Same transport and contracts; deeper research retains the primary model.
+    fast_model: str | None = None
 
     def __post_init__(self) -> None:
         if not (0 < self.timeout_seconds <= 60 and 0 <= self.max_retries <= 1
@@ -66,6 +73,9 @@ class LLMConfig:
             raise ValueError("模型精确输入缓存有效期须在 0 至 900 秒之间")
         if self.thinking_mode not in {"auto", "disabled", "enabled", "omit"}:
             raise ValueError("thinking_mode 必须为 auto、disabled、enabled 或 omit")
+        if self.fast_model is not None and (not self.fast_model.strip() or len(self.fast_model) > 128
+                                           or any(char.isspace() for char in self.fast_model)):
+            raise ValueError("快速模型名称不能为空、含空白或超过128字符")
         for price in (self.input_price_per_million, self.output_price_per_million):
             if price is not None and (price < 0 or not math.isfinite(price)):
                 raise ValueError("模型价格须为非负有限数值，单位 USD/百万 token")
@@ -86,6 +96,7 @@ class LLMConfig:
             max_input_chars=int(os.getenv("WENCE_LLM_MAX_INPUT_CHARS", "60000")),
             thinking_mode=os.getenv("WENCE_LLM_THINKING_MODE", "auto").strip().lower(),
             cache_ttl_seconds=float(os.getenv("WENCE_LLM_CACHE_TTL_SECONDS", "120")),
+            fast_model=os.getenv("WENCE_LLM_FAST_MODEL", "").strip() or None,
             input_price_per_million=(float(os.environ["WENCE_LLM_INPUT_USD_PER_MILLION"])
                                      if os.getenv("WENCE_LLM_INPUT_USD_PER_MILLION") else None),
             output_price_per_million=(float(os.environ["WENCE_LLM_OUTPUT_USD_PER_MILLION"])
@@ -102,7 +113,8 @@ class OpenAICompatibleLLM:
         self._semaphore = asyncio.Semaphore(config.max_concurrency)
         # 一个应用进程共享连接池，避免每个并行专业节点都重复建立 TCP/TLS 连接。
         # 请求级超时仍由 complete_json 的总预算控制，不改变重试和降级路径。
-        self._client = httpx.AsyncClient(transport=transport, timeout=config.timeout_seconds)
+        self._client = httpx.AsyncClient(transport=transport, timeout=config.timeout_seconds,
+                                       verify=verified_ssl_context() if transport is None else True)
         self._responses = ModelResponseCache(config.cache_ttl_seconds)
 
     async def aclose(self) -> None:
@@ -115,12 +127,17 @@ class OpenAICompatibleLLM:
         """队列等待、重试及网络共同受单次总超时限制，不截断事实或语义输入。"""
         # 紧凑 JSON 不删减任何字段，只移除无语义空白，减少传输与模型输入 token。
         content = json.dumps(payload, ensure_ascii=False, default=str, separators=(",", ":"))
+        wire_payload, references = compact_fact_references(payload)
+        wire_content = json.dumps(wire_payload, ensure_ascii=False, default=str, separators=(",", ":"))
         collector = analysis_telemetry.get()
+        model = (self.config.fast_model if collector and collector.get("mode") == "fast"
+                 and self.config.fast_model else self.config.model)
         sent_facts = payload.get("authorized_facts") or []
         started = perf_counter()
         record: dict[str, Any] = {"purpose": (payload.get("required_output") or {}).get("agent_id")
                                   or (payload.get("required_schema") or {}).get("title", "semantic"),
-                                  "model": self.config.model, "input_chars": len(system) + len(content),
+                                  "model": model, "input_chars": len(system) + len(wire_content),
+                                  "reference_chars_saved": len(content) - len(wire_content),
                                   "input_fact_count": len(sent_facts),
                                   "queue_ms": 0, "network_ms": 0, "attempts": 0,
                                   "prompt_tokens": None, "completion_tokens": None,
@@ -131,30 +148,52 @@ class OpenAICompatibleLLM:
             async with asyncio.timeout(self.config.timeout_seconds):
                 async with self._semaphore:
                     record["queue_ms"] = round((perf_counter() - started) * 1000, 2)
-                    return await self._complete(system, content, record,
+                    raw = await self._complete(system, wire_content, record,
                         fast=bool(collector and collector.get("mode") == "fast"))
+                    return rewrite_fact_references(raw, references)
         try:
-            if len(system) + len(content) > self.config.max_input_chars:
+            if len(system) + len(wire_content) > self.config.max_input_chars:
+                record["reason_code"] = "MODEL_INPUT_BUDGET_EXCEEDED"
                 raise RuntimeError("模型输入超过预算")
             scope = collector.get("cache_scope") if collector else None
-            if scope is not None and self.config.cache_ttl_seconds:
-                key = hashlib.sha256(json.dumps([scope, collector.get("mode"), system, content],
+            local_key = hashlib.sha256(json.dumps([id(self), model, collector.get("mode") if collector else None,
+                system, content], ensure_ascii=False).encode()).hexdigest()
+            local_responses = collector.setdefault("_responses", {}) if collector is not None else {}
+            if self.config.cache_ttl_seconds and local_key in local_responses:
+                result = deepcopy(local_responses[local_key])
+                record["cache_hit"] = True
+                record["request_cache_hit"] = True
+                record["estimated_cost_usd"] = 0
+            elif scope is not None and self.config.cache_ttl_seconds:
+                key = hashlib.sha256(json.dumps([scope, model, collector.get("mode"), system, content],
                                                ensure_ascii=False).encode()).hexdigest()
                 result, hit = await self._responses.get(key, perform,
-                    cacheable=lambda result: self._cacheable(result, payload))
+                    cacheable=lambda result: self._cacheable(result, payload),
+                    cancel_if_unused=(collector.get("mode") == "fast"
+                                      or (payload.get("required_schema") or {}).get("title")
+                                      in {"SemanticReasonRepair", "StockEvidenceReview"}))
                 record["cache_hit"] = hit
                 if hit:
                     record["estimated_cost_usd"] = 0
             else:
                 result = await perform()
                 record["cache_hit"] = False
+            # 仅本次请求的精确输入复用；画像、事实/引用或模式改变都会重新调用。
+            # 不存失败或无效结构，不跨匿名请求，也不跳过后续事实与合规闸门。
+            if (collector is not None and self.config.cache_ttl_seconds
+                    and len(local_responses) < 128 and self._cacheable(result, payload)):
+                local_responses[local_key] = deepcopy(result)
             record["status"] = "completed"
             return result
         except TimeoutError as exc:
             record["status"] = "timeout"
+            record["reason_code"] = "MODEL_TIME_BUDGET_EXCEEDED"
             raise RuntimeError("模型调用超过总时间预算") from exc
         except asyncio.CancelledError:
             record["status"] = "cancelled"
+            raise
+        except RuntimeError:
+            record["status"] = "failed"
             raise
         finally:
             record["total_ms"] = round((perf_counter() - started) * 1000, 2)
@@ -168,12 +207,19 @@ class OpenAICompatibleLLM:
         try:
             schema = payload.get("required_schema")
             if schema:
-                from backend.app.semantic import RequestUnderstanding, OutputReview, ProfileExtraction
+                from backend.app.semantic import (
+                    RequestUnderstanding, OutputReview, ProfileExtraction, SemanticReasonRepair,
+                    StockEvidenceReview, cacheable_stock_evidence,
+                )
                 model = {"RequestUnderstanding": RequestUnderstanding, "OutputReview": OutputReview,
-                         "ProfileExtraction": ProfileExtraction}.get(schema.get("title"))
+                         "ProfileExtraction": ProfileExtraction,
+                         "SemanticReasonRepair": SemanticReasonRepair,
+                         "StockEvidenceReview": StockEvidenceReview}.get(schema.get("title"))
                 if model is None:
                     return False
-                model.model_validate(result)
+                validated = model.model_validate(result)
+                if model is StockEvidenceReview and not cacheable_stock_evidence(validated, payload):
+                    return False
             agent_id = (payload.get("required_output") or {}).get("agent_id")
             if agent_id:
                 candidate = AgentResult.model_validate({"status": "completed", "confidence": 0,
@@ -182,13 +228,15 @@ class OpenAICompatibleLLM:
                 allowed = {fact["fact_id"] for fact in payload.get("authorized_facts", [])}
                 if not set(candidate.facts_used) <= allowed:
                     return False
+                if not set(candidate.data_requirements) <= set(AGENT_DATA_CAPABILITIES.get(agent_id, ())):
+                    return False
             return True
         except (ValidationError, ValueError, TypeError):
             return False
 
     async def _complete(self, system: str, content: str, record: dict[str, Any], *, fast: bool = False) -> dict[str, Any]:
         request_body = {
-            "model": self.config.model,
+            "model": record["model"],
             "temperature": 0.1,
             "max_tokens": min(1000, self.config.max_output_tokens) if fast else self.config.max_output_tokens,
             "response_format": {"type": "json_object"},
@@ -197,13 +245,17 @@ class OpenAICompatibleLLM:
                 {"role": "user", "content": content},
             ],
         }
-        # DeepSeek V4 默认思考可能耗尽有限输出预算，导致正文为空。
-        # auto 仅对已知 V4 协议发送参数，其他兼容服务不接收供应商扩展字段。
+        # Qwen 和 DeepSeek 使用不同的思考协议。Qwen 3.5 默认开启思考，
+        # 仅省略参数会让意图分类等结构化任务也支付完整思考时延。
+        qwen_hybrid = record["model"].lower().startswith(("qwen3.5-plus", "qwen3.5-flash"))
         thinking_mode = self.config.thinking_mode
         if thinking_mode == "auto":
-            thinking_mode = "disabled" if self.config.model.lower().startswith("deepseek-v4-") else "omit"
+            thinking_mode = "disabled" if qwen_hybrid or record["model"].lower().startswith("deepseek-v4-") else "omit"
         if thinking_mode != "omit":
-            request_body["thinking"] = {"type": thinking_mode}
+            if qwen_hybrid:
+                request_body["enable_thinking"] = thinking_mode == "enabled"
+            else:
+                request_body["thinking"] = {"type": thinking_mode}
         headers = {"Authorization": f"Bearer {self.config.api_key}"}
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries + 1):
@@ -225,26 +277,34 @@ class OpenAICompatibleLLM:
                     if type(count) is int and count >= 0:
                         record[key] = (record[key] or 0) + count
                 if (record["prompt_tokens"] is not None and record["completion_tokens"] is not None
+                        and record["model"] == self.config.model
                         and self.config.input_price_per_million is not None
                         and self.config.output_price_per_million is not None):
                     record["estimated_cost_usd"] = round((record["prompt_tokens"] * self.config.input_price_per_million
                         + record["completion_tokens"] * self.config.output_price_per_million) / 1_000_000, 8)
                 choice = body["choices"][0]
                 if choice.get("finish_reason") == "length":
+                    record["reason_code"] = "MODEL_OUTPUT_TRUNCATED"
                     raise RuntimeError("模型输出已达到 token 上限，未接受截断结果")
                 raw = choice["message"]["content"]
                 result = raw if isinstance(raw, dict) else json.loads(raw)
                 if not isinstance(result, dict):
                     raise ValueError("模型输出必须是 JSON 对象")
+                record.pop("reason_code", None)
+                record.pop("http_status", None)
                 return result
             except httpx.HTTPStatusError as exc:
                 last_error = exc
+                record["http_status"] = exc.response.status_code
+                record["reason_code"] = "MODEL_HTTP_ERROR"
                 if exc.response.status_code != 429 and exc.response.status_code < 500:
                     break
             except httpx.TransportError as exc:
                 last_error = exc
+                record["reason_code"] = "MODEL_TRANSPORT_ERROR"
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 # 无效结构不重复付费；调用方执行受限降级。
+                record["reason_code"] = "MODEL_JSON_INVALID"
                 raise RuntimeError("模型输出格式无效") from exc
             if attempt < self.config.max_retries:
                 await asyncio.sleep(0.1 * (2**attempt))
@@ -273,6 +333,7 @@ class HybridInvestmentAgent(BaseAgent):
             "profile": profile_for_model(request.profile),
             "authorized_facts": [fact_for_model(fact) for fact in model_facts],
             "rule_baseline": baseline_for_model(baseline),
+            "allowed_data_capabilities": [cap.value for cap in AGENT_DATA_CAPABILITIES[self.agent_id]],
             "required_output": {
                 "agent_id": self.agent_id,
                 "status": "completed|degraded|unknown",
@@ -295,13 +356,37 @@ class HybridInvestmentAgent(BaseAgent):
             "研判中缺少必要资料时，从 required_output.data_requirements 列出的允许能力中"
             "选择最多8项最小集合写入 data_requirements，后端会自动调用问财补取并重新研判；"
             "资料已足够时返回空数组。不要把所有允许能力都返回，不得输出方法名、URL或密钥。"
+            "data_requirements 的每一项必须是 allowed_data_capabilities 中的英文原样字符串，"
+            "它表示取数能力，绝不能填写缺失的评分字段名称。"
+            "例如行业缺少 prosperity_score 或 capital_flow_score 时只请求 industry；"
+            "具体缺失字段保留在规则明细中，不填入 data_requirements。"
             "不得改变 rule_baseline 的准入、数值与风险约束；不得承诺收益或给自动交易指令。"
             "只返回 required_output 对应的 JSON。面向普通用户：opinion 先结论后依据，2至3句、150字内；"
             "术语随附短解释，不展示内部名称、字段编码、评分或运行过程。风险、分歧和资料限制必须保留；"
             "列表去重且各不超过3项，每项一句中文。"
         )
+        if request.research_mode == "deep":
+            payload["required_output"]["opinion"] = "中文研究分析，300至500字；分述核心判断、支持证据、反面证据与判断限制"
+            system = system.replace("2至3句、150字内", "300至500字，按核心判断、支持证据、反面证据、判断限制分段")
+            system += (
+                "深入研究需同时检查支持与反对当前判断的证据；没有某一侧证据时明确写未发现足够证据，不能编造多空理由。"
+                "每项关键判断必须使用facts_used中的数据，写明数据所属期，不把获取日期当报告期。"
+                "risk_flags写具体风险传导路径，invalidation_conditions写可观察的变化条件。"
+                "不同标的、不同期间或不同统计口径分别解释，缺同行及历史基准时不得直接断言低估或高估。"
+                "最终输出要能让用户理解数据为什么支持或限制结论。"
+            )
         if request.research_mode == "fast":
-            system += "本次为快速研究：opinion控制在80字内；风险与缺口必须保留，其余列表最多2项。"
+            # Empty supplemental fields have model defaults. Avoid generating
+            # copies of deterministic details already merged below.
+            payload["required_output"].pop("details")
+            payload["required_output"].pop("confidence_reasons")
+            system += (
+                "本次为快速研究：opinion控制在80字内；风险与缺口必须保留，其余列表最多2项。"
+                "只输出required_output中的字段；规则明细与置信度依据由后端原样保留；"
+                "无新增风险或失效条件时相应列表返回空数组，后端会合并规则基线的完整约束。"
+                "facts_used只引用支撑本节点结论的事实，使用authorized_facts中的原样编号。"
+            )
+        failure_code = "MODEL_OUTPUT_INVALID"
         try:
             raw = await self.llm.complete_json(system=system, payload=payload)
             if not isinstance(raw, dict):
@@ -311,10 +396,14 @@ class HybridInvestmentAgent(BaseAgent):
             raw.setdefault("confidence", 0)
             raw.setdefault("opinion", baseline.opinion)
             raw.setdefault("facts_used", [])
+            failure_code = "MODEL_SCHEMA_INVALID"
             candidate = AgentResult.model_validate(raw)
+            failure_code = "MODEL_UNKNOWN_REFERENCE"
             self.ensure_fact_only(candidate.facts_used, model_facts)
+            failure_code = "MODEL_UNAPPROVED_CAPABILITY"
             if not set(candidate.data_requirements) <= set(AGENT_DATA_CAPABILITIES[self.agent_id]):
                 raise ValueError("模型请求了职责范围外的数据能力")
+            failure_code = "MODEL_OUTPUT_INVALID"
             candidate.data_requirements = list(dict.fromkeys(candidate.data_requirements))
             if candidate.data_requirements:
                 candidate.status = TaskStatus.DEGRADED
@@ -328,6 +417,8 @@ class HybridInvestmentAgent(BaseAgent):
                 candidate.confidence_reasons.append("大模型输出没有可核验事实引用")
             # 保留可复算的风险、准入结果和数值明细；LLM 补充研判不能改写硬约束。
             candidate.risk_flags = sorted(set(baseline.risk_flags + candidate.risk_flags))
+            candidate.confidence_reasons = list(dict.fromkeys(
+                baseline.confidence_reasons + candidate.confidence_reasons))
             candidate.invalidation_conditions = list(dict.fromkeys(
                 baseline.invalidation_conditions + candidate.invalidation_conditions))
             if baseline.status in {TaskStatus.DEGRADED, TaskStatus.UNKNOWN, TaskStatus.FAILED}:
@@ -351,13 +442,25 @@ class HybridInvestmentAgent(BaseAgent):
                 )
             candidate.details = {
                 **baseline.details, "llm_assessment": candidate.details,
-                "engine": "third_party_llm", "model": self.llm.config.model,
+                "engine": "third_party_llm", "model": (model_call_for(self.agent_id) or {}).get(
+                    "model", self.llm.config.model),
             }
             return candidate
-        except (RuntimeError, ValidationError, ValueError, TypeError):
+        except (RuntimeError, ValidationError, ValueError, TypeError) as exc:
+            call = model_call_for(self.agent_id)
+            code = call.get("reason_code", failure_code) if call else failure_code
+            diagnostics = {"reason_code": code}
+            if isinstance(exc, ValidationError):
+                diagnostics["validation_errors"] = [
+                    {"field": e["loc"][0] if e["loc"] and e["loc"][0] in AgentResult.model_fields
+                     else "<extra_field>", "type": e["type"]}
+                    for e in exc.errors(include_input=False, include_context=False, include_url=False)
+                ]
+            mark_model_result(self.agent_id, status="validation_failed" if not isinstance(exc, RuntimeError)
+                              else (call or {}).get("status", "failed"), **diagnostics)
             fallback = baseline.model_copy(deep=True)
             fallback.confidence_reasons.append("第三方大模型不可用或输出未通过结构化校验，已回退规则引擎")
-            fallback.details = {**fallback.details, "engine": "rule_fallback"}
+            fallback.details = {**fallback.details, "engine": "rule_fallback", "model_failure": diagnostics}
             return fallback
 
 

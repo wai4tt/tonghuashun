@@ -1,5 +1,6 @@
 """Recommendation dispatch, profile matching and adversarial evidence boundaries."""
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -10,6 +11,7 @@ from backend.app import main
 from backend.app.agents.coordinator import CoordinatorAgent, basic_compliance_check, verify_facts
 from backend.app.agents.rule_agents import make_rule_agents
 from backend.app.models import FactRecord, Intent, OrchestrationRequest
+from backend.app.research_routing import PROFILE_STOCK_RECOMMENDATION_QUERY
 from backend.app.data_provider.iwencai import IwencaiSkillHubProvider
 from backend.app.services.provider_errors import ProviderCallError
 from backend.app.semantic import RequestUnderstanding, SemanticService
@@ -23,6 +25,7 @@ def request(**profile_changes):
     profile = {"confirmed": True, "risk_level": "R3", "horizon_months": 24,
                "max_drawdown": .20, "liquidity_need": "中", "preferred_product_types": ["权益类"]}
     return OrchestrationRequest(query="推荐几支符合我的投资偏好的股票", research_direction="个股研究",
+                                research_mode="deep",
                                 profile={**profile, **profile_changes})
 
 
@@ -401,3 +404,25 @@ def test_existing_analyze_endpoint_dispatches_recommendation_with_no_new_fronten
     assert "600002" in body["conclusion"]
     assert body["profile_version"] == 1
     assert body["data_acquisition"]["mode"] == "live"
+
+
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_fixed_stock_recommendation_query_routes_directly_and_preserves_review(monkeypatch, confirmed):
+    model = Model(action="analyze")
+    backend = service(Provider(), model)
+    monkeypatch.setattr(main, "analysis_timeout_seconds", .001)
+    monkeypatch.setattr(main, "coordinator", backend.coordinator)
+    monkeypatch.setattr(main, "research_pipeline", backend.pipeline)
+    payload = request(confirmed=confirmed).model_copy(update={"query": PROFILE_STOCK_RECOMMENDATION_QUERY})
+    response = TestClient(main.app).post("/api/v1/portfolio/analyze/stream", json=payload.model_dump(mode="json"))
+    events = [json.loads(line) for line in response.text.splitlines()]
+    assert response.status_code == 200
+    assert all(title != "RequestUnderstanding" for title, _ in model.calls)
+    if not confirmed:
+        assert events[-1]["type"] == "error" and events[-1]["status_code"] == 409
+        assert not model.calls
+        return
+    assert "按投资偏好筛选股票" in [event["stage"] for event in events if event["type"] == "progress"]
+    assert events[-1]["advice"]["stock_recommendation"]["recommendations"]
+    assert events[-1]["advice"]["compliance"]["status"] == "PASS"
+    assert any(title == "OutputReview" for title, _ in model.calls)

@@ -1,0 +1,103 @@
+{
+  "version": 1,
+  "skills": {
+    "hithink-astock-selector": {
+      "name": "hithink-astock-selector",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-astock-selector",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "b83e0ab83d0122f85406b6a1b425ffba23ea866c83f95beb10233731d98b0f5a"
+    },
+    "hithink-market-query": {
+      "name": "hithink-market-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-market-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "6a530a183c1fc3db10f07c9636d1fc2fecf40fb4c2d07a7f8726f04793af92d1"
+    },
+    "hithink-finance-query": {
+      "name": "hithink-finance-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-finance-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "1707eafbab035c1ef9bfd28c487de554c9210ee9dac61d313abe50148d45ffe0"
+    },
+    "hithink-macro-query": {
+      "name": "hithink-macro-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-macro-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "97f47a4e24293b22673b35b6e47735b5d4611b322b0963fdfef880caf5453822"
+    },
+    "hithink-basicinfo-query": {
+      "name": "hithink-basicinfo-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-basicinfo-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "5fe9ccaec5db955f71d43cfbfdfa58d357e3b440a1412cf7b7ae135c19709b5b"
+    },
+    "hithink-industry-query": {
+      "name": "hithink-industry-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-industry-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "5d104589c29de424f7720df8f725c17618a23d5033acb4dceb524c3d60f3cb20"
+    },
+    "hithink-management-query": {
+      "name": "hithink-management-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-management-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "f8277f2ec8a8d5c7c02315f1e8f11e9dc026c62b152701a4527ab511b65ba634"
+    },
+    "hithink-event-query": {
+      "name": "hithink-event-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-event-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "7c181c5e69779936faa552528a559c32d8d754810b28ad53ecb55911d82254bf"
+    },
+    "news-search": {
+      "name": "news-search",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=news-search",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "59423dcac541ae034d5adaf149e08b806590e934fae48e8453066da3469ba1ae"
+    },
+    "report-search": {
+      "name": "report-search",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=report-search",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "3cc62c98e7e485e53e760c2676427e92ec647db450bb12c5b7625db76186fdf4"
+    },
+    "announcement-search": {
+      "name": "announcement-search",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=announcement-search",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "6b16a09a47ed12b313c6b2ae3e2e457887e5ce6821abf459c01921cd87a7e34c"
+    },
+    "hithink-business-query": {
+      "name": "hithink-business-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-business-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "20bdd0f2c2b46e75c17890cf05a8da1b35db19c21d5b1bcab022feb19f2c5446"
+    },
+    "hithink-insresearch-query": {
+      "name": "hithink-insresearch-query",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-insresearch-query",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "7bd382548fbedf13825fbb023f01f695685f3e9292c1c9ec8cafaaaf110d3ca0"
+    },
+    "hithink-sector-selector": {
+      "name": "hithink-sector-selector",
+      "zip_url": "https://ms.10jqka.com.cn/gateway/market/api/v1/skills/square/download?name=hithink-sector-selector",
+      "source": "skillhub",
+      "version": "1.0.0",
+      "skill_sha256": "e580b07b3cb285b25ca5341453ffedf19bbf8eb0e596258904923da44728ad61"
+    }
+  }
+}

@@ -210,6 +210,7 @@ def test_http_response_serializes_the_new_panel_contract(monkeypatch, semantic):
         {"portfolio": portfolio}, verify_facts, basic_compliance_check, semantic=semantic))
     response = TestClient(main.app).post("/api/v1/portfolio/analyze", json={
         "query": "请诊断我的持仓组合", "profile": profile().model_dump(mode="json"),
+        "research_mode": "deep",
         "auto_fetch": False, "facts": [fact.model_dump(mode="json") for fact in facts()],
     })
     assert response.status_code == 200

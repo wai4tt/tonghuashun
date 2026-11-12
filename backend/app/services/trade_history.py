@@ -75,7 +75,13 @@ def _workbook(request: TradeHistoryUpload):
                 sheet = book[name]
                 if (sheet.max_column or 0) > MAX_COLS or (sheet.max_row or 0) > MAX_ROWS + 30:
                     raise ValueError("工作表最多支持 20,000 条交易和 60 列，请删除空白格式区域或拆分文件。")
-                return sheet.iter_rows(values_only=True)
+                sheet.reset_dimensions()
+                def bounded_rows():
+                    for index, values in enumerate(sheet.iter_rows(values_only=True), 1):
+                        if index > MAX_ROWS + 30 or len(values) > MAX_COLS:
+                            raise ValueError("工作表最多支持 20,000 条交易和 60 列。")
+                        yield values
+                return bounded_rows()
         else:
             import xlrd
             book = xlrd.open_workbook(file_contents=raw, on_demand=True)
@@ -146,7 +152,7 @@ def _header_row(rows, specified=None, expected=()):
 
 
 def inspect_trade_workbook(request: TradeHistoryUpload) -> dict:
-    with _workbook(request) as (_, names, rows):
+    with _workbook(request) as (raw, names, rows):
         name = request.sheet_name or names[0]
         if name not in names:
             raise ValueError("所选工作表不存在。")
@@ -158,12 +164,19 @@ def inspect_trade_workbook(request: TradeHistoryUpload) -> dict:
                     name = candidate
                     break
         header, columns, suggested = _header_row(rows(name), request.header_row)
+        if not all(k in suggested for k in REQUIRED):
+            from backend.app.services.trade_report import read_trade_report
+            report = read_trade_report(raw=raw, names=names, rows=rows, file_name=request.file_name)
+            if report:
+                return {"input_kind": "analysis_report", "sheets": names, "sheet_name": name,
+                        "header_row": header, "columns": columns, "suggested_columns": suggested,
+                        "preview": [], "report_preview": report}
         preview = []
         # 预览仅输出交易字段；不回传账户姓名等无关原始列。
         for n, values in enumerate(rows(name), 1):
             if n <= header:
                 continue
-            preview.append({FIELD_LABELS[k]: _text(values[columns.index(v)])
+            preview.append({FIELD_LABELS[k]: _text(values[columns.index(v)] if columns.index(v) < len(values) else None)
                             for k, v in suggested.items() if k not in {"account", "trade_id"}})
             if len(preview) >= 5:
                 break
@@ -262,6 +275,11 @@ def analyze_trade_history(request: TradeHistoryUpload, *, today: date | None = N
         header, headers, suggested = _header_row(rows(name), request.header_row,
                                                  [request.columns[k] for k in REQUIRED if request.columns.get(k)])
         columns = {k: v for k, v in {**suggested, **request.columns}.items() if v}
+        if not request.columns and not all(k in columns for k in REQUIRED):
+            from backend.app.services.trade_report import read_trade_report
+            report = read_trade_report(raw=raw, names=names, rows=rows, file_name=request.file_name)
+            if report:
+                return report
         missing = [FIELD_LABELS[k] for k in REQUIRED if not columns.get(k)]
         if missing:
             raise ValueError("请匹配必填列：" + "、".join(missing))

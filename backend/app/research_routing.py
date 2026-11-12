@@ -18,6 +18,9 @@ DIRECTION_FOR_INTENT: dict[Intent, str] = {
     Intent.CONVERTIBLE_BOND_ANALYSIS: "可转债分析",
 }
 
+PROFILE_STOCK_RECOMMENDATION_QUERY = "个股研究：请按我已确认的投资偏好推荐最多3只A股股票。"
+
+
 ROUTE_CARDS = (
     (Intent.MARKET_ANALYSIS, "市场解读", "大盘、指数、宏观环境、全市场走势和总体风险；不分析某只股票、基金或可转债。",
      "当前 A 股市场如何；沪深 300 走势；宏观政策对市场的影响"),

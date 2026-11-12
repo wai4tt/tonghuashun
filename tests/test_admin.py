@@ -195,7 +195,7 @@ def test_analysis_and_stream_save_server_derived_consultation_metadata(admin_app
     registered = client.post("/api/v1/auth/register", json={"username": "alice", "password": "ordinary-pass"}).json()
     headers = {"Authorization": "Bearer " + registered["access_token"]}
     profile = client.post("/api/v1/profile/confirm", headers=headers, json={"profile": risk_questionnaire_payload}).json()
-    payload = {"query": "请诊断我的持仓组合", "profile": {"version": profile["version"], "confirmed": True},
+    payload = {"query": "请诊断我的持仓组合", "research_mode": "deep", "profile": {"version": profile["version"], "confirmed": True},
                "auto_fetch": False, "conversation_id": "analytics-chat",
                "_analytics": {"domain": "fund_screening", "topic": "forged-topic"}}
     assert client.post("/api/v1/portfolio/analyze", headers=headers, json=payload).status_code == 200

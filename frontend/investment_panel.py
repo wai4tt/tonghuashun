@@ -97,11 +97,13 @@ def render_investment_panel(advice: dict, *, key: str, compact: bool = False) ->
             st.markdown(f"**{title}**")
             st.write(texts[0])
         return
-    import altair as alt
-    import pandas as pd
+    returns = return_scenario_rows(advice)
+    positions = allocation_rows(advice)
+    if returns or positions:
+        import altair as alt
+        import pandas as pd
 
     with st.expander("收益预期", expanded=False, key=f"return_expectation_{key}"):
-        returns = return_scenario_rows(advice)
         for text in sections[0][1]:
             st.write(text)
         if returns:
@@ -120,7 +122,6 @@ def render_investment_panel(advice: dict, *, key: str, compact: bool = False) ->
             })
     with st.container(border=True):
         st.markdown("**仓位建议**")
-        positions = allocation_rows(advice)
         if positions:
             chart = alt.Chart(pd.DataFrame(positions)).mark_bar(size=18).encode(
                 x=alt.X("下限（%）:Q", title="资产类别目标区间（%）", scale=alt.Scale(domain=[0, 100])),

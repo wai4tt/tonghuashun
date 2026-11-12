@@ -101,6 +101,21 @@ async def test_overview_uses_bounded_readonly_jobs(direction):
 
 
 @pytest.mark.asyncio
+async def test_convertible_overview_uses_short_query_with_distinct_target():
+    provider = Provider()
+    result = await fetch_overview(provider, DataOverviewRequest(direction="convertible"))
+    assert result.status == "ok"
+    assert provider.calls == [
+        ("query", "可转债按成交额从高到低前8只，最新价、涨跌幅、转股溢价率", {"limit": 8})
+    ]
+
+    provider.calls.clear()
+    await fetch_overview(provider, DataOverviewRequest(direction="convertible", target="转债甲"))
+    assert ("query", "转债甲 可转债最新价、涨跌幅、转股溢价率", {"limit": 8}) in provider.calls
+    assert ("history", "转债甲", {"asset_type": "可转债", "limit": 30}) in provider.calls
+
+
+@pytest.mark.asyncio
 async def test_overview_retains_successful_sections_when_macro_fails():
     result = await fetch_overview(Provider(failing={"macro"}), DataOverviewRequest(direction="market"))
     assert result.status == "partial"
@@ -171,3 +186,20 @@ def test_provider_rounded_latest_percentage_does_not_hide_dated_nav_change():
                         fact("nav_change", -1.68381, period="2026-09-24").model_dump()])
     assert not rows[0]["conflicts"]
     assert format_fact(rows[0]["fields"]["nav_change"]) == "-1.68%"
+
+
+@pytest.mark.asyncio
+async def test_industry_target_changes_provider_query_and_news():
+    class IndustryProvider(Provider):
+        async def get_news(self, query):
+            self.calls.append(("news", query))
+            return [fact("news", "测试行业资讯")]
+    for target in ("广告营销", "半导体", "884178.TI"):
+        provider = IndustryProvider()
+        result = await fetch_overview(provider, DataOverviewRequest(direction="industry", target=target))
+        assert result.target == target
+        query = next(call for call in provider.calls if call[0] == "query")
+        assert target in query[1]
+        assert "排名前8" not in query[1]
+        assert query[2]["skill_id"] == "hithink-industry-query"
+        assert target in next(call[1] for call in provider.calls if call[0] == "news")

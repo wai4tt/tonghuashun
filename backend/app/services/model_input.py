@@ -19,6 +19,7 @@ from backend.app.fact_taxonomy import (
     PORTFOLIO_FIELDS,
     SCORE_FIELDS,
     SLOW_FINANCIAL_FIELDS,
+    fact_is_current,
 )
 from backend.app.models import FactRecord, Intent
 
@@ -156,7 +157,9 @@ def slice_facts_for_agent(facts: list[FactRecord], agent_id: str, baseline_ids: 
                 required.add(parent)
                 pending.append(parent)
     relevant = set(INTENT_FIELD_PRIORITY[role_intent])
-    extra = [fact for fact in facts if fact.field.casefold() in relevant and fact.fact_id not in required]
+    current = datetime.now(timezone.utc)
+    extra = [fact for fact in facts if fact.field.casefold() in relevant and fact.fact_id not in required
+             and fact_is_current(fact, current)]
     budget = 40 if mode == "fast" else 80
     selected, _ = slice_facts_for_model(extra, role_intent, limit=max(0, budget - len(required)),
                                       multi_record_limit=2 if mode == "fast" else MULTI_RECORD_LIMIT)

@@ -31,8 +31,8 @@ def _matching_facts(facts: Iterable[FactRecord], names: set[str]) -> list[FactRe
         if not _field_matches(fact, names):
             continue
         if fact.field.lower() in SCORE_FIELDS and (not fact_is_current(fact, now)
-                or type(fact.value) not in {int, float} or not math.isfinite(fact.value)
-                or not 0 <= fact.value <= 100):
+                or type(fact.value) not in {int, float} or not 0 <= fact.value <= 100
+                or not math.isfinite(fact.value)):
             continue
         key = (fact.entity, fact.field.lower())
         previous = selected.get(key)
