@@ -6,6 +6,7 @@ import re
 from urllib.parse import urlsplit, urlunsplit
 import streamlit as st
 from frontend.research_report import render_research_report, report_sections
+from frontend.insight_panel import render_insight_panel
 from frontend.answer_report import answer_images, build_answer_pdf, chart_groups, cited_facts
 from frontend.presentation import (plain_language, render_conclusion_panel, render_logic_chain, render_source_trace, source_trace_rows, friendly_fact_rows, TOPIC_LABELS)
 from frontend.presentation import render_verification_records
@@ -134,7 +135,8 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
     if (advice.get("research_mode") == "auto" and compliance.get("status") != "BLOCK"
             and (advice.get("answer_fact_ids") or advice.get("source_reference") or advice.get("response_scope") == "clarification")):
         render_automatic_answer(advice)
-        render_research_report(advice, key=export_key, compact=compact)
+        render_research_report(advice, key=export_key, compact=compact, question=question)
+        render_insight_panel(advice, key=export_key, compact=compact)
         if advice.get("evidence"):
             _render_pdf_download(advice, question, export_key)
         return
@@ -185,8 +187,9 @@ def render_advice(advice: dict[str, Any], *, export_key: str = "answer", questio
             if details.open:
                 render_logic_chain(advice)
         render_source_trace(advice, key=f"sources_{export_key}")
-    render_research_report(advice, key=export_key, compact=compact)
+    render_research_report(advice, key=export_key, compact=compact, question=question)
     render_stock_recommendation(advice)
+    render_insight_panel(advice, key=export_key, compact=compact)
     if acquisition.get("reused_capabilities"):
         st.caption("本次沿用了仍在有效期内的已有资料。")
     if acquisition.get("reason_code") == "MODEL_UNAVAILABLE":

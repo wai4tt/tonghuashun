@@ -3,6 +3,7 @@ import asyncio
 from datetime import datetime, timezone
 import re
 from backend.app.models.schemas import DataOverviewRequest, ComparisonItem, ComparisonResponse
+from backend.app.services.investment_decision import build_decision
 
 DIRECTIONS = {"股票": "stock", "基金": "fund", "可转债": "convertible", "行业": "industry"}
 FIELDS = {
@@ -24,7 +25,7 @@ def matching_fact(target, fact):
     return target.casefold() == str(fact.entity).strip().casefold()
 
 
-async def fetch_snapshots(cache, provider, targets, *, wait=True, refresh=False):
+async def fetch_snapshots(cache, provider, targets, *, wait=True, refresh=False, decide=False):
     async def load(target, kind, item_id):
         direction = DIRECTIONS[kind]
         skill = "hithink-fund-query" if kind == "基金" else "hithink-astock-selector" if kind == "行业" else "hithink-market-query"
@@ -47,6 +48,7 @@ async def fetch_snapshots(cache, provider, targets, *, wait=True, refresh=False)
             message = "未取得可核对的标的数据。"
         return ComparisonItem(target=target, asset_type=kind, watchlist_id=item_id, status=status,
             entity=facts[0].entity if facts else None, entity_code=next(iter(codes)) if len(codes) == 1 and facts else None,
+            display_name=facts[0].entity if facts else None,
             facts=facts[:80], fetched_at=result.fetched_at, message=message)
     items = await asyncio.gather(*(load(*target) for target in targets))
     identities = set()
@@ -57,4 +59,5 @@ async def fetch_snapshots(cache, provider, targets, *, wait=True, refresh=False)
             identities.add(item.entity_code)
     count = sum(bool(item.facts) for item in items)
     status = "loading" if any(item.status == "loading" for item in items) else "ok" if count == len(items) and all(item.status == "ok" for item in items) else "partial" if count else "unavailable" if any(item.status == "unavailable" for item in items) else "empty"
-    return ComparisonResponse(fetched_at=datetime.now(timezone.utc), status=status, items=items)
+    decision = build_decision(items, asset_type=targets[0][1]) if decide and len(items) >= 2 else None
+    return ComparisonResponse(fetched_at=datetime.now(timezone.utc), status=status, items=items, decision=decision)

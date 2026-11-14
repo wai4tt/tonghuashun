@@ -360,7 +360,8 @@ def render_news(facts: list[dict]) -> None:
             st.caption(str(published))
 
 
-def render_research_board(api_base: str, page_direction: str, fetch: Callable) -> None:
+def render_research_board(api_base: str, page_direction: str, fetch: Callable,
+                          api_request: Callable | None = None) -> None:
     direction = DIRECTIONS[page_direction]
     target = st.session_state.get(f"board_target_{direction}", "600519" if direction == "stock" else None)
     key = (api_base, direction, target)
@@ -370,10 +371,11 @@ def render_research_board(api_base: str, page_direction: str, fetch: Callable) -
     st.session_state[f"board_poll_{direction}"] = polling
     # Keep the selected board fresh even after the initial load has finished.
     # load_board coalesces pending work and only refetches expired entries.
-    st.fragment(run_every=1 if polling else 15)(_render_research_board)(api_base, page_direction, fetch)
+    st.fragment(run_every=1 if polling else 15)(_render_research_board)(api_base, page_direction, fetch, api_request)
 
 
-def _render_research_board(api_base: str, page_direction: str, fetch: Callable) -> None:
+def _render_research_board(api_base: str, page_direction: str, fetch: Callable,
+                           api_request: Callable | None = None) -> None:
     direction = DIRECTIONS[page_direction]
     with st.container(key=f"research-board-{direction}"):
         with st.container(horizontal=True, vertical_alignment="center"):
@@ -498,6 +500,11 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable) 
             with st.container(border=True):
                 st.markdown("**" + {"market": "指数明细", "industry": "行业明细", "stock": "股票行情一览", "fund": "基金指标一览", "convertible": "转债指标一览"}[direction] + "**")
                 render_table(rows, direction)
+        if direction == "market" and api_request is not None:
+            from frontend.index_board import render_index_board
+            render_index_board(api_base, api_request, key="market")
+        if direction == "industry" and target and api_request is not None:
+            _render_industry_trend(api_base, target, api_request)
         macro = section_facts(result, "macro")
         news = section_facts(result, "news")
         if macro or news:
@@ -519,6 +526,32 @@ def _render_research_board(api_base: str, page_direction: str, fetch: Callable) 
         if any(row["conflicts"] for row in [*rows, *detail_rows]):
             st.caption("部分同日期指标存在不一致，已暂时隐藏相关数值，待进一步核对。")
         st.caption("列表为数据浏览范围，不代表投资推荐。百分比按问财原值展示；缺失指标以 — 标注。")
+
+
+def _render_industry_trend(api_base: str, target: str, api_request: Callable) -> None:
+    """按需读取行业指数点位并给出走势判断；不写入投资建议证据。"""
+
+    from frontend.trend_view import render_trend_panel
+
+    cache = st.session_state.setdefault("industry_trend_cache", {})
+    key = f"{api_base}|{target}"
+    with st.container(border=True):
+        st.markdown("**行业走势与中和判断**")
+        st.caption("行业指数点位只用于走势观察，计算口径与个股一致：MA5、三日累计升幅与多信号中和。")
+        if st.button("加载 / 刷新行业走势", key="industry_trend_load", icon=":material/show_chart:"):
+            cache[key] = {"result": api_request(api_base, "POST", "/data/price-history",
+                                                {"target": target, "asset_type": "行业", "limit": 30})}
+            while len(cache) > 8:
+                cache.pop(next(iter(cache)))
+        entry = cache.get(key)
+        if not entry:
+            st.caption("点击按钮后才会读取该行业的历史点位。")
+            return
+        result = entry["result"] if isinstance(entry.get("result"), dict) else {}
+        if result.get("status") != "ok":
+            st.caption(result.get("message") or "问财暂未返回该行业的历史点位。")
+            return
+        render_trend_panel(result, key="industry_trend", unit_label=" 点")
 
 
 def restore_board_scroll(page_direction: str, *, has_conversation: bool) -> None:

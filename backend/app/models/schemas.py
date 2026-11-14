@@ -16,6 +16,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from .research_report import ResearchReport
+from .trend import MovingAveragePoint, TrendAnalysis
+from .decision import ComparisonDecision
 
 from backend.app.risk_questionnaire import validate_answers
 
@@ -562,10 +564,10 @@ class DataOverviewResponse(BaseModel):
 
 
 class PriceHistoryRequest(BaseModel):
-    """按一个明确标的读取有限条数的历史价格或净值。"""
+    """按一个明确标的读取有限条数的历史价格、净值或指数点位。"""
 
     target: str = Field(min_length=1, max_length=60)
-    asset_type: Literal["股票", "基金", "可转债"]
+    asset_type: Literal["股票", "基金", "可转债", "指数", "行业"]
     limit: Literal[30, 60] = 30
 
     @field_validator("target")
@@ -584,13 +586,16 @@ class PriceHistoryPoint(BaseModel):
 
 class PriceHistoryResponse(BaseModel):
     target: str
-    asset_type: Literal["股票", "基金", "可转债"]
-    metric_label: Literal["收盘价", "单位净值"]
+    asset_type: Literal["股票", "基金", "可转债", "指数", "行业"]
+    metric_label: Literal["收盘价", "单位净值", "收盘点位", "行业指数"]
     status: Literal["ok", "empty", "unavailable"]
     fetched_at: datetime
     source_name: str = "同花顺问财"
     source_url: str | None = None
     points: list[PriceHistoryPoint] = Field(default_factory=list)
+    # 五日均线序列与多信号中和判断；只描述已有价格走势，不进入证据链。
+    ma5: list[MovingAveragePoint] = Field(default_factory=list)
+    analysis: TrendAnalysis | None = None
     message: str | None = None
 
 
@@ -820,6 +825,8 @@ class ComparisonItem(BaseModel):
     watchlist_id: int | None = None
     entity: str | None = None
     entity_code: str | None = None
+    # 界面展示用名称：数据源核实名称优先，其次是账号自选保存的名称。
+    display_name: str | None = None
     status: Literal["ok", "partial", "empty", "unavailable", "loading"]
     fetched_at: datetime | None = None
     facts: list[FactRecord] = Field(default_factory=list)
@@ -830,6 +837,8 @@ class ComparisonResponse(BaseModel):
     fetched_at: datetime
     status: Literal["ok", "partial", "empty", "unavailable", "loading"]
     items: list[ComparisonItem] = Field(default_factory=list)
+    # 两个以上同类型标的时给出的确定性投资价值排序；资料不足时为 insufficient。
+    decision: ComparisonDecision | None = None
 
 
 class PortfolioHoldingInput(BaseModel):
@@ -866,6 +875,13 @@ class PortfolioPlanRequest(BaseModel):
     rebalance_threshold: float = Field(default=0.02, ge=0, le=0.25)
     total_value: float | None = Field(default=None, gt=0, le=1e12)
     risk_level: str | None = Field(default=None, max_length=20)
+
+
+class ReportExportRequest(BaseModel):
+    """把服务端已生成的结构化报告渲染为可下载文本；不重新解释结论。"""
+
+    report: ResearchReport
+    question: str | None = Field(default=None, max_length=500)
 
 
 class GroundingCheckRequest(BaseModel):
