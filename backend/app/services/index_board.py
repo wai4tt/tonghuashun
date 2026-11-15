@@ -79,24 +79,31 @@ async def fetch_index_board(provider: Any, *, limit: int = HISTORY_LIMIT) -> Ind
                                   message="数据源尚未配置") for name, code in INDEXES],
         )
     names = "、".join(name for name, _ in INDEXES)
+    # 失败原因要如实回传给页面：额度用完、密钥无效和“真的没有数据”不是一回事。
+    quote_error: str | None = None
     try:
         quotes = await asyncio.wait_for(provider.query(
             f"{names}的指数简称、指数代码、最新价、涨跌幅、成交额", limit=len(INDEXES)), timeout=26)
-    except (RuntimeError, TimeoutError, ValueError):
+    except (RuntimeError, TimeoutError, ValueError) as exc:
         quotes = []
+        quote_error = str(exc).strip() or type(exc).__name__
     semaphore = asyncio.Semaphore(4)
     results = await asyncio.gather(
         *(_load_history(provider, name, semaphore) for name, _ in INDEXES),
         return_exceptions=True,
     )
     series: dict[str, Any] = {}
+    history_error: str | None = None
     for (name, _code), result in zip(INDEXES, results):
         if isinstance(result, BaseException) or not result:
+            if history_error is None and isinstance(result, BaseException):
+                history_error = str(result).strip() or type(result).__name__
             continue
         cleaned = close_series([(getattr(fact, "period", None), getattr(fact, "value", None))
                                 for fact in result])
         if len(cleaned) >= 2:
             series[name] = cleaned
+    failure_reason = quote_error or history_error
     benchmark = series.get(BENCHMARK)
     items: list[IndexQuoteItem] = []
     notes: list[str] = []
@@ -130,11 +137,13 @@ async def fetch_index_board(provider: Any, *, limit: int = HISTORY_LIMIT) -> Ind
             analysis=analysis,
             points=[round(value, 4) for _, value in cleaned.points] if cleaned else [],
             dates=[day for day, _ in cleaned.points] if cleaned else [],
-            message=None if available else "问财本次未返回带日期的历史点位。",
+            message=None if available else (failure_reason or "问财本次未返回带日期的历史点位。"),
         )
         items.append(item)
         if not available:
             notes.append(f"{name}的历史点位暂未取得，未给出走势判断。")
+    if failure_reason:
+        notes.append(f"本次指数数据未取得：{failure_reason}")
     ok = sum(item.status == "ok" for item in items)
     status = "ok" if ok == len(items) else "partial" if ok or quotes or series else "unavailable"
     if series and not quotes:
