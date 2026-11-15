@@ -581,19 +581,22 @@ class IwencaiSkillHubProvider:
     async def get_price_history(
         self, target: str, asset_type: str, *, limit: int = 30
     ) -> list[FactRecord]:
-        """沿用已开通的只读查询 Skill，返回有真实日期的价格/净值事实。"""
+        """沿用已开通的只读查询 Skill，返回有真实日期的价格/净值/点位事实。"""
 
-        if asset_type not in {"股票", "基金", "可转债"} or limit not in {30, 60}:
-            raise ValueError("历史走势仅支持股票、基金和可转债的近 30 或 60 期数据")
+        if asset_type not in {"股票", "基金", "可转债", "指数", "行业"} or limit not in {30, 60}:
+            raise ValueError("历史走势仅支持股票、基金、可转债、指数和行业的近 30 或 60 期数据")
         metric = "fund_nav" if asset_type == "基金" else "close_price"
-        label = "单位净值" if metric == "fund_nav" else "收盘价"
+        label = {"基金": "单位净值", "指数": "收盘点位", "行业": "行业指数收盘点位"}.get(
+            asset_type, "收盘价")
+        skill = ("hithink-fund-query" if asset_type == "基金"
+                 else "hithink-industry-query" if asset_type == "行业" else "hithink-market-query")
         query = f"{target}近{limit}个交易日每日{label}，逐日列出日期和{label}"
         return await self._request(
             "/v1/query2data",
             {"query": query, "page": "1", "limit": str(limit),
              "is_cache": "1", "expand_index": "true"},
             entity_hint=target,
-            skill_id="hithink-fund-query" if metric == "fund_nav" else "hithink-market-query",
+            skill_id=skill,
             skill_version="1.0.0",
             history_metric=metric,
             history_limit=limit,
@@ -1406,7 +1409,13 @@ def _history_record_code(record: dict[str, Any]) -> str | None:
 
 def _history_metric_matches(raw_key: str, metric: str) -> bool:
     name = raw_key.strip()
-    return name.startswith("单位净值") if metric == "fund_nav" else name.startswith("收盘价")
+    # 行业/指数列可能带 "指数@"、"板块@" 前缀，去掉后再判断列名口径。
+    name = re.sub(r"^(?:指数|板块|行业)@", "", name)
+    if metric == "fund_nav":
+        return name.startswith("单位净值")
+    if metric == "close_price":
+        return name.startswith(("收盘价", "收盘点位", "收盘指数", "指数收盘"))
+    return False
 
 
 def _history_facts(

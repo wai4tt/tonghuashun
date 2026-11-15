@@ -7,9 +7,24 @@ from frontend.research_board import LABELS
 FIELDS = ["close_price", "fund_nav", "change", "nav_change", "pe_ttm", "pb", "roe", "revenue_growth", "net_profit_growth", "fund_size", "fee_rate", "tracking_error", "conversion_premium_rate", "yield_to_maturity", "remaining_size", "industry", "fund_manager", "bond_rating"]
 
 
+def _labels(items):
+    """表头使用“名称 · 代码”，名称缺失时回退到用户输入；重名时追加序号。"""
+
+    labels, used = [], {}
+    for item in items:
+        name = item.get("display_name") or item.get("entity") or item.get("target") or "—"
+        code = item.get("entity_code")
+        label = str(name)
+        if code and str(code) not in label:
+            label = f"{label} · {code}"
+        used[label] = used.get(label, 0) + 1
+        labels.append(label if used[label] == 1 else f"{label}#{used[label]}")
+    return labels
+
+
 def comparison_matrix(items):
     rows = []
-    names = [item.get("target", "—") for item in items]
+    names = _labels(items)
     for field in FIELDS:
         buckets = []
         for item in items:

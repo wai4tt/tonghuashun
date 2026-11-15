@@ -11,7 +11,7 @@ from threading import Event
 from typing import Any
 from urllib.parse import quote_plus
 
-from sqlalchemy import Float, case, cast, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, select
+from sqlalchemy import Float, case, cast, DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, create_engine, func, inspect, select, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -161,6 +161,8 @@ class WatchlistRow(Base):
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
     target: Mapped[str] = mapped_column(String(60), nullable=False)
     asset_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 从数据源核准的证券简称；取不到时保持为空，由行情返回后再展示。
+    name: Mapped[str | None] = mapped_column(String(60), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True
     )
@@ -214,16 +216,29 @@ class Database:
             return
         try:
             Base.metadata.create_all(self.engine)
-            # create_all 不会为已存在的表补建索引。
+            # create_all 不会为已存在的表补建索引，也不会补列。
             for table in (ConversationRow.__table__, MessageRow.__table__):
                 for index in table.indexes:
                     if index.name in {"ix_conversations_user_updated", "ix_messages_user_conversation_id"}:
                         index.create(self.engine, checkfirst=True)
+            self._ensure_watchlist_name_column()
             if backfill:
                 self._backfill_consultations()
             self.initialization_error = None
         except SQLAlchemyError as exc:
             self.initialization_error = type(exc).__name__
+
+    def _ensure_watchlist_name_column(self) -> None:
+        """旧库补上自选名称列；失败时由上层统一记录初始化错误。"""
+
+        if self.engine is None:
+            return
+        with self.engine.connect() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("watchlist_items")}
+            if "name" in columns:
+                return
+        with self.engine.begin() as connection:
+            connection.execute(text("ALTER TABLE watchlist_items ADD COLUMN name VARCHAR(60) NULL"))
 
     def backfill_consultations(self, stop_event: Event | None = None) -> None:
         """表结构就绪后可在后台补齐统计，不阻塞应用接收请求。"""
@@ -368,7 +383,8 @@ class Database:
             ).all()
             return [self._watchlist_dict(row) for row in rows]
 
-    def add_watchlist_item(self, user_id: int, target: str, asset_type: str) -> dict[str, Any]:
+    def add_watchlist_item(self, user_id: int, target: str, asset_type: str,
+                           name: str | None = None) -> dict[str, Any]:
         """新增账号自选；最多 50 条，并把并发重复写转换成可读业务错误。"""
 
         self.require_ready()
@@ -389,13 +405,34 @@ class Database:
                 )
                 if int(count or 0) >= 50:
                     raise WatchlistCapacityExceeded("自选标的最多保存 50 个，请先移除不再关注的标的")
-                row = WatchlistRow(user_id=user_id, target=target, asset_type=asset_type)
+                row = WatchlistRow(user_id=user_id, target=target, asset_type=asset_type,
+                                   name=(name or "").strip()[:60] or None)
                 session.add(row)
                 session.flush()
                 result = self._watchlist_dict(row)
             return result
         except IntegrityError as exc:
             raise WatchlistItemExists("该标的已在自选中") from exc
+
+    def set_watchlist_name(self, user_id: int, item_id: int, name: str | None) -> bool:
+        """补写数据源核实的证券简称；空值不覆盖已有名称。"""
+
+        cleaned = (name or "").strip()[:60]
+        if not cleaned:
+            return False
+        self.require_ready()
+        assert self.session_factory is not None
+        with self.session_factory.begin() as session:
+            row = session.scalar(
+                select(WatchlistRow).where(
+                    WatchlistRow.id == item_id,
+                    WatchlistRow.user_id == user_id,
+                )
+            )
+            if row is None or row.name == cleaned:
+                return False
+            row.name = cleaned
+            return True
 
     def remove_watchlist_item(self, user_id: int, item_id: int) -> bool:
         """只允许删除当前账号自己的自选项。"""
@@ -722,5 +759,6 @@ class Database:
             "id": row.id,
             "target": row.target,
             "asset_type": row.asset_type,
+            "name": getattr(row, "name", None),
             "created_at": cls._utc(row.created_at),
         }

@@ -1,4 +1,5 @@
 """自选列表、单标的详情与结构化对比页面。"""
+import re
 from datetime import date
 import altair as alt
 import pandas as pd
@@ -6,6 +7,7 @@ import streamlit as st
 from streamlit.runtime.scriptrunner import get_script_run_ctx
 from frontend.answer_report import chart_groups
 from frontend.comparison import comparison_matrix
+from frontend.decision_view import render_decision
 from frontend.financial_view import period_info
 from frontend.presentation import WATCHLIST_RESEARCH_PREFIX, RESEARCH_PREFIX, fact_time, render_empty_state
 from frontend.research_board import entity_rows, format_fact, data_period
@@ -22,7 +24,11 @@ def quote_rows(items, snapshot):
         entities = entity_rows(facts)
         fields = entities[0]["fields"] if entities else {}
         primary = fields.get("fund_nav") if item.get("asset_type") == "基金" else fields.get("close_price")
-        row = {"标的": item["target"], "类型": item.get("asset_type", "股票"), "证券代码": quote.get("entity_code") or "未提供",
+        # 名称优先用数据源核实结果，其次用添加自选时保存的名称，最后才回退到用户输入。
+        name = quote.get("display_name") or item.get("name") or (entities[0]["name"] if entities else None) or item["target"]
+        code = quote.get("entity_code") or (
+            item["target"] if re.fullmatch(r"\d{5,6}(\.\w{2})?", str(item["target"]).strip()) else "未提供")
+        row = {"名称": name, "代码": code, "类型": item.get("asset_type", "股票"), "标的": item["target"],
             "价格 / 净值": format_fact(primary), "涨跌幅": format_fact(fields.get("change") or fields.get("nav_change")),
             "数据日期": data_period(primary), "状态": "更新中" if quote.get("status") == "loading" else "可查看" if primary else "暂无行情"}
         rows.append(row)
@@ -38,6 +44,16 @@ def _wait_quotes(signature, fetch):
             st.rerun()
         return
     st.caption("正在取得自选行情，其他操作可继续使用。")
+
+
+def _item_label(item: dict) -> str:
+    """展示“名称 · 代码”，名称缺失时回退到用户输入。"""
+
+    name = item.get("name") or item.get("target") or "—"
+    target = str(item.get("target") or "")
+    if target and target != name and re.fullmatch(r"\d{5,6}(\.\w{2})?", target.strip()):
+        return f"{name} · {target}"
+    return str(name)
 
 
 def quote_table(api_base, items, factory):
@@ -100,6 +116,7 @@ def _comparison_result(api_base, actions):
         return
     st.dataframe(rows, hide_index=True, width="stretch", key="comparison_matrix")
     st.caption("优先选择各标的共有的最新期间；期间、单位不一致或缺失的指标明确标为不可直接比较。表格不代表买卖建议。")
+    render_decision(result.get("decision"), key="watchlist")
     eligible = [row for row in rows if row["可比性"] == "同期间、同单位"]
     facts = [fact for item in items for fact in item.get("facts", [])]
     chart_advice = {"facts": facts, "evidence": [fact.get("fact_id") for fact in facts]}
@@ -170,10 +187,11 @@ def render_watchlist(api_base, actions):
         previous = st.session_state.get("watchlist_focus")
         if previous not in lookup:
             st.session_state.watchlist_focus = next(iter(lookup))
-        focused_id = st.selectbox("查看标的详情", list(lookup), format_func=lambda item_id: str(lookup[item_id]["target"]), key="watchlist_focus")
+        focused_id = st.selectbox("查看标的详情", list(lookup),
+                                  format_func=lambda item_id: _item_label(lookup[item_id]), key="watchlist_focus")
         item = lookup[focused_id]
         with st.container(border=True):
-            st.markdown("**" + item["target"] + "** · " + item.get("asset_type", "股票"))
+            st.markdown("**" + _item_label(item) + "** · " + item.get("asset_type", "股票"))
             st.caption("加入时间 " + fact_time(item.get("created_at")))
             with st.container(horizontal=True):
                 if st.button("开始研究", key=f"watchlist_research_{focused_id}", icon=":material/travel_explore:", disabled=not actions["ready"]()):
@@ -195,7 +213,7 @@ def render_watchlist(api_base, actions):
             actions["history"](api_base, [item])
     if len(items) >= 2:
         st.subheader("横向比较")
-        labels = {int(item["id"]): f"{item['target']} · {item.get('asset_type', '股票')}" for item in items}
+        labels = {int(item["id"]): f"{_item_label(item)} · {item.get('asset_type', '股票')}" for item in items}
         before = st.session_state.get("watchlist_compare_ids", [])
         valid = [item_id for item_id in before if item_id in labels][:4]
         if valid != before:

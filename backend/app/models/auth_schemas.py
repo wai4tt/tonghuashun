@@ -96,4 +96,6 @@ class WatchlistItem(BaseModel):
     id: int
     target: str
     asset_type: AssetType
+    # 数据源核准的证券简称；只按代码添加时用它补全名称，取不到则为空。
+    name: str | None = None
     created_at: datetime

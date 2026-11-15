@@ -26,6 +26,7 @@ from backend.app.services.history import cited_facts_of
 from backend.app.services.model_telemetry import analysis_telemetry, summarize_costs
 from backend.app.services.local_consultation import LocalConsultationService, select_scope
 from backend.app.services.instant_research import InstantResearchService
+from backend.app.services.trend_analytics import analyze_trend
 from backend.app.services.research_recovery import recover_research
 from backend.app.services.stock_recommendation import STOCK_RECOMMENDATION_TIMEOUT_SECONDS, StockRecommendationService
 from backend.app.services.automatic_consultation import run_automatic, source_item
@@ -69,6 +70,7 @@ from backend.app.models import (
     PriceHistoryRequest,
     PriceHistoryPoint,
     PriceHistoryResponse,
+    ReportExportRequest,
     Intent,
     OrchestrationRequest,
     ProfileAssessment,
@@ -98,12 +100,17 @@ from backend.app.models.schemas import (
     PortfolioPlanRequest,
 )
 from backend.app.services.comparison import fetch_snapshots
+from backend.app.models.index_board import IndexBoardResponse
+from backend.app.services.security_names import resolve_security_name
+from backend.app.services.research_report import research_report_markdown
 from backend.app.risk_questionnaire import assessment_is_current
 from backend.app.models.trade_history import TradeHistoryUpload
 from backend.app.services.trade_history import inspect_trade_workbook, analyze_trade_history
 from backend.app.services.overview_cache import OverviewCache
 overview_cache = OverviewCache()
 prepared_research_cache = PreparedResearchCache()
+from backend.app.services.index_board import IndexBoardCache
+index_board_cache = IndexBoardCache()
 from backend.app.services.admin import consultation_metadata
 from backend.app.services.call_tracking import calling_user_id
 from backend.app.services.login_guard import login_throttle
@@ -164,6 +171,7 @@ async def lifespan(_: FastAPI):
             await reaper
         await prepared_research_cache.aclose()
         await overview_cache.aclose()
+        await index_board_cache.aclose()
         await research_pipeline.cache.aclose()
         from backend.app.services.disclosure_reader import close_document_caches
         await close_document_caches()
@@ -648,19 +656,24 @@ def list_watchlist(user: dict[str, object] = Depends(customer_user)) -> list[Wat
 
 
 @app.post("/api/v1/watchlist", response_model=WatchlistItem, tags=["watchlist"])
-def add_watchlist_item(
+async def add_watchlist_item(
     request: WatchlistItemCreate,
     user: dict[str, object] = Depends(customer_user),
 ) -> WatchlistItem:
-    """新增自选标的；重复项和容量限制以可操作错误返回。"""
+    """新增自选标的，并尽力把代码补全为数据源核实的证券简称。"""
 
     try:
-        row = database.add_watchlist_item(int(user["id"]), request.target, request.asset_type)
-        return WatchlistItem.model_validate(row)
+        row = await asyncio.to_thread(
+            database.add_watchlist_item, int(user["id"]), request.target, request.asset_type)
     except WatchlistItemExists as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except WatchlistCapacityExceeded as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    name = await resolve_security_name(data_provider, request.target, request.asset_type)
+    if name and await asyncio.to_thread(
+            database.set_watchlist_name, int(user["id"]), int(row["id"]), name):
+        row = {**row, "name": name}
+    return WatchlistItem.model_validate(row)
 
 
 @app.delete("/api/v1/watchlist/{item_id}", tags=["watchlist"])
@@ -767,14 +780,20 @@ async def research_data_overview(
 @app.post("/api/v1/data/compare", response_model=ComparisonResponse, tags=["data"])
 async def compare_data(request: ComparisonRequest, user: dict[str, object] = Depends(customer_user)):
     return await fetch_snapshots(overview_cache, data_provider,
-        [(target, request.asset_type, None) for target in request.targets], refresh=request.refresh)
+        [(target, request.asset_type, None) for target in request.targets],
+        refresh=request.refresh, decide=True)
 
 
 @app.post("/api/v1/data/watchlist-quotes", response_model=ComparisonResponse, tags=["data"])
 async def watchlist_quotes(request: SnapshotOptions, user: dict[str, object] = Depends(customer_user)):
     items = database.list_watchlist(int(user["id"]))[:20]
-    return await fetch_snapshots(overview_cache, data_provider,
+    result = await fetch_snapshots(overview_cache, data_provider,
         [(item["target"], item["asset_type"], item["id"]) for item in items], wait=request.wait, refresh=request.refresh)
+    # 界面优先显示数据源核实名称；取不到时用添加自选时保存的名称。
+    saved = {int(item["id"]): item.get("name") for item in items}
+    for entry in result.items:
+        entry.display_name = entry.entity or saved.get(entry.watchlist_id) or None
+    return result
 
 
 @app.post("/api/v1/data/price-history", response_model=PriceHistoryResponse, tags=["data"])
@@ -785,7 +804,8 @@ async def price_history(
     """为已登录用户按需读取真实日期序列；不把走势当作投资结论。"""
 
     del user
-    metric_label = "单位净值" if request.asset_type == "基金" else "收盘价"
+    metric_label = {"基金": "单位净值", "指数": "收盘点位", "行业": "行业指数"}.get(
+        request.asset_type, "收盘价")
     common = {
         "target": request.target, "asset_type": request.asset_type,
         "metric_label": metric_label, "fetched_at": datetime.now(timezone.utc),
@@ -806,13 +826,26 @@ async def price_history(
         for fact in facts if fact.period
     ]
     urls = {fact.source_url for fact in facts if fact.source_url}
+    analysis = analyze_trend(points) if len(points) >= 2 else None
     return PriceHistoryResponse(
         **common,
         status="ok" if len(points) >= 2 else "empty",
         points=points if len(points) >= 2 else [],
+        ma5=analysis.ma5_series if analysis else [],
+        analysis=analysis,
         source_url=next(iter(urls)) if len(urls) == 1 else None,
         message=None if len(points) >= 2 else "问财暂未返回足够的带日期数值，无法绘制走势。",
     )
+
+
+@app.post("/api/v1/market/index-board", response_model=IndexBoardResponse, tags=["data"])
+async def market_index_board(
+    request: SnapshotOptions, user: dict[str, object] = Depends(customer_user),
+) -> IndexBoardResponse:
+    """主要指数的行情、五日均线、三日升幅与中和判断；固定模板取数。"""
+
+    del user
+    return await index_board_cache.get(data_provider, refresh=request.refresh)
 
 
 @app.post("/api/v1/portfolio/plan", tags=["advice"])
@@ -889,6 +922,19 @@ async def grounding_check(request: GroundingCheckRequest) -> dict[str, object]:
     """把一段投顾文字与一组事实做数值对账（幻觉检测的可复用入口）。"""
 
     return check_text_grounding(request.text, list(request.facts))
+
+
+@app.post("/api/v1/research/report/markdown", tags=["advice"])
+async def export_research_markdown(
+    request: ReportExportRequest, user: dict[str, object] = Depends(customer_user),
+) -> dict[str, object]:
+    """把已生成的报告渲染为 Markdown，供用户下载留档。"""
+
+    del user
+    markdown = research_report_markdown(request.report, question=request.question)
+    stamp = datetime.now(timezone.utc).astimezone().strftime("%Y%m%d-%H%M")
+    return {"filename": f"问策智投_投资分析报告_{stamp}.md", "markdown": markdown,
+            "targets": request.report.targets, "status": request.report.status}
 
 
 @app.post("/api/v1/profile/assess", response_model=ProfileAssessment, tags=["profile"])

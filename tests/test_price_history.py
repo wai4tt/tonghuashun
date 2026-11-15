@@ -108,7 +108,7 @@ def test_history_api_requires_login_and_returns_only_chart_fields(monkeypatch) -
         )
         invalid = client.post(
             "/api/v1/data/price-history",
-            json={"target": "600519", "asset_type": "行业"},
+            json={"target": "600519", "asset_type": "债券"},
         )
     finally:
         main_module.app.dependency_overrides.pop(main_module.authenticated_user, None)

@@ -1072,9 +1072,9 @@ def render_research_page(api_base: str, direction: str) -> None:
     if st.session_state.conversation:
         with st.expander("本页领域数据", expanded=False, on_change="rerun", icon=":material/monitoring:") as section:
             if section.open:
-                render_research_board(api_base, direction, create_board_fetch(api_base))
+                render_research_board(api_base, direction, create_board_fetch(api_base), api_request=api_request)
     else:
-        render_research_board(api_base, direction, create_board_fetch(api_base))
+        render_research_board(api_base, direction, create_board_fetch(api_base), api_request=api_request)
     if not profile_ready():
         st.info("请先确认投资偏好，再开始分析。", icon=":material/person_edit:")
         st.button("进行风险评估", type="primary", on_click=go_to, args=("风险评估",))
@@ -1446,11 +1446,11 @@ def page_watchlist(api_base: str) -> None:
 
 def render_price_history_panel(api_base: str, items: list[dict[str, Any]]) -> None:
     """用户选择标的后才取数；走势不进入投资建议的事实与合规链。"""
-    import altair as alt
-    import pandas as pd
+
+    from frontend.trend_view import render_trend_panel
 
     eligible = [item for item in items if item.get("asset_type", "股票") in {"股票", "基金", "可转债"}]
-    st.subheader("历史走势")
+    st.subheader("历史走势 · 五日均线与中和判断")
     if not eligible:
         st.info("当前自选中没有可展示收盘价或单位净值走势的标的。")
         return
@@ -1458,7 +1458,9 @@ def render_price_history_panel(api_base: str, items: list[dict[str, Any]]) -> No
     with st.container(key="price-history-panel", border=True):
         selected_id = st.selectbox(
             "查看标的", list(options),
-            format_func=lambda item_id: f"{options[item_id].get('target', '—')} · {options[item_id].get('asset_type', '股票')}",
+            format_func=lambda item_id: f"{options[item_id].get('name') or options[item_id].get('target', '—')}"
+                                        f" · {options[item_id].get('asset_type', '股票')}",
+            key="price_history_target",
         )
         selected = options[selected_id]
         target = str(selected.get("target", "")).strip()
@@ -1480,26 +1482,9 @@ def render_price_history_panel(api_base: str, items: list[dict[str, Any]]) -> No
         if result.get("status") != "ok" or len(result.get("points") or []) < 2:
             st.info(result.get("message") or "带日期的数据不足，暂时无法绘制走势。")
             return
-        rows = [
-            {"日期": str(point["date"]), "数值": float(point["value"])}
-            for point in result["points"]
-        ]
-        metric_label = str(result.get("metric_label") or "收盘价")
-        chart = (
-            alt.Chart(pd.DataFrame(rows))
-            .mark_line(color="#ad384e", point=True, strokeWidth=2.5)
-            .encode(
-                x=alt.X("日期:T", title="日期", axis=alt.Axis(format="%m/%d")),
-                y=alt.Y("数值:Q", title=metric_label, scale=alt.Scale(zero=False)),
-                tooltip=[alt.Tooltip("日期:T", title="日期", format="%Y-%m-%d"),
-                         alt.Tooltip("数值:Q", title=metric_label, format=",.4f")],
-            )
-            .properties(height=250)
-        )
-        st.altair_chart(chart, width="stretch")
+        render_trend_panel(result, key=f"price_history_{selected_id}")
         st.caption(
-            f"{result.get('source_name') or '同花顺问财'} · 数据日期 {rows[0]['日期']} 至 {rows[-1]['日期']}"
-            f" · 查询于 {fact_time(result.get('fetched_at'))}"
+            f"{result.get('source_name') or '同花顺问财'} · 查询于 {fact_time(result.get('fetched_at'))}"
         )
         if result.get("source_url"):
             st.link_button("查看数据来源", str(result["source_url"]), icon=":material/open_in_new:")
